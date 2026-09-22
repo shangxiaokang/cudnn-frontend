@@ -1,0 +1,147 @@
+{
+  "name": "480p16fps-packed-seed16",
+  "seed": 16,
+  "max_padded_tokens": 262144,
+  "latent_height": 30,
+  "latent_width": 53,
+  "video_fps": 16,
+  "temporal_compression": 4,
+  "audio_sample_rate": 48000,
+  "audio_vae_frame_size": 1920,
+  "sparsity": 0.1,
+  "duration_buckets": [
+    {
+      "min_seconds": 3,
+      "max_seconds": 5,
+      "probability": 0.2
+    },
+    {
+      "min_seconds": 5,
+      "max_seconds": 10,
+      "probability": 0.4
+    },
+    {
+      "min_seconds": 10,
+      "max_seconds": 17,
+      "probability": 0.2
+    },
+    {
+      "min_seconds": 17,
+      "max_seconds": 30,
+      "probability": 0.15
+    },
+    {
+      "min_seconds": 30,
+      "max_seconds": 60,
+      "probability": 0.05
+    }
+  ],
+  "reference_probability": 0.25,
+  "max_text_tokens": 16384,
+  "text_max_duration_seconds": 60,
+  "samples": [
+    {
+      "bucket": "5-10",
+      "total_seconds": 8.75,
+      "target_seconds": 8.75,
+      "reference_seconds": 0.0,
+      "text_tokens": 2390,
+      "target_latent_shape": [
+        36,
+        30,
+        53
+      ],
+      "reference_latent_shape": null,
+      "audio_tokens": 219,
+      "real_tokens": 59849,
+      "padded_tokens": 67200
+    },
+    {
+      "bucket": "5-10",
+      "total_seconds": 5.0,
+      "target_seconds": 5.0,
+      "reference_seconds": 0.0,
+      "text_tokens": 1366,
+      "target_latent_shape": [
+        21,
+        30,
+        53
+      ],
+      "reference_latent_shape": null,
+      "audio_tokens": 125,
+      "real_tokens": 34881,
+      "padded_tokens": 39168
+    },
+    {
+      "bucket": "10-17",
+      "total_seconds": 12.0,
+      "target_seconds": 6.0,
+      "reference_seconds": 6.0,
+      "text_tokens": 3277,
+      "target_latent_shape": [
+        25,
+        30,
+        53
+      ],
+      "reference_latent_shape": [
+        25,
+        30,
+        53
+      ],
+      "audio_tokens": 150,
+      "real_tokens": 82927,
+      "padded_tokens": 93120
+    },
+    {
+      "bucket": "5-10",
+      "total_seconds": 7.25,
+      "target_seconds": 7.25,
+      "reference_seconds": 0.0,
+      "text_tokens": 1980,
+      "target_latent_shape": [
+        30,
+        30,
+        53
+      ],
+      "reference_latent_shape": null,
+      "audio_tokens": 182,
+      "real_tokens": 49862,
+      "padded_tokens": 55936
+    }
+  ],
+  "real_tokens": 227519,
+  "padded_tokens": 255424,
+  "sampling": {
+    "candidate_count": 5,
+    "sample_count": 4,
+    "duration_histogram": {
+      "3-5": 0,
+      "5-10": 3,
+      "10-17": 1,
+      "17-30": 0,
+      "30-60": 0
+    },
+    "reference_count": 1,
+    "reference_fraction": 0.25,
+    "oversized_rejected": [],
+    "deferred_candidate": {
+      "bucket": "5-10",
+      "total_seconds": 6.0,
+      "target_seconds": 6.0,
+      "reference_seconds": 0.0,
+      "text_tokens": 1639,
+      "real_tokens": 41539,
+      "padded_tokens": 46656
+    },
+    "stop_reason": "next_candidate_exceeds_remaining_budget",
+    "remaining_padded_tokens": 6720,
+    "notes": [
+      "Probabilities describe candidate draws; a finite pack and the token cap do not preserve the exact duration histogram.",
+      "Durations use quarter-second ticks. Bucket upper endpoints are excluded except the final 60-second endpoint.",
+      "The sampled duration is target plus reference video duration; each clip has its own extra causal latent frame.",
+      "Text is ceil(16384 * total_seconds / 60), capped at 16384. Total duration includes target and reference video. Reference video uses floor(total_ticks / 2); target video receives the remainder.",
+      "Audio follows target duration at 25 tokens per second; there is no reference audio or reference image.",
+      "Seed 16 was selected as a fixed four-sample demonstration with three target-only samples and one reference sample; other seeds need not realize this exact 75/25 split."
+    ]
+  }
+}

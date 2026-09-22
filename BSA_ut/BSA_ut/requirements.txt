@@ -1,0 +1,13 @@
+# Install CUDA-compatible PyTorch separately (see README).
+setuptools>=75,<82
+setuptools-scm>=8,<10
+wheel>=0.44,<1
+ninja==1.11.1.1
+cmake>=3.23,<4
+pybind11[global]==2.13.6
+nvidia-cudnn-cu13==9.15.1.9
+nvidia-cutlass-dsl[cu13]==4.6.2
+apache-tvm-ffi==0.1.12
+torch-c-dlpack-ext==0.1.5
+typing_extensions>=4.12
+cuda-python>=12.8
