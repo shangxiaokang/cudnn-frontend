@@ -92,13 +92,11 @@ def run_case(case, args, flush):
             # Padded query outputs are discarded by production's gather.
             do.masked_fill_(~valid, 0)
 
-        use_block_causal_fastpath = (
-            case == "bsa-causal"
-            and args.bsa_causal_bwd_backend == "flex"
-        )
-        production_backend = (
-            args.production_bwd_backend if case == "production" else "fused"
-        )
+        use_block_causal_fastpath = case == "bsa-causal" and args.bsa_causal_bwd_backend == "flex"
+        # ``blk64`` is the benchmark-facing name for the fused K-major BSA
+        # implementation.  ``flex`` also enters the public API as ``fused``;
+        # the explicit block_causal contract below selects its dedicated path.
+        backward_backend = "split" if args.bsa_causal_bwd_backend == "split" else "fused"
         # The exact fast path derives the natural tail block from S.  Keep the
         # block_sizes tensor for forward/FLOP accounting and omit it only from
         # this backward call so arbitrary ragged metadata cannot be ignored.
@@ -113,17 +111,17 @@ def run_case(case, args, flush):
                 do, q, k, v, out, lse, **backward_metadata,
                 sparse_block_size=64, layout="bshd",
                 block_causal=use_block_causal_fastpath,
-                backward_backend=production_backend,
+                backward_backend=backward_backend,
                 qmajor_block_n=args.qmajor_block_n,
                 bucket_size_blocks=args.bucket_size_blocks,
             )
 
         if (
             case == "bsa-causal"
-            and args.bsa_causal_bwd_backend == "flex"
+            and args.bsa_causal_bwd_backend in ("flex", "split")
             and args.verify_fastpath
         ):
-            fast = backward()
+            candidate = backward()
             baseline = BSA.block_sparse_attention_backward(
                 do,
                 q,
@@ -135,20 +133,26 @@ def run_case(case, args, flush):
                 sparse_block_size=64,
                 layout="bshd",
                 block_causal=False,
+                backward_backend="fused",
+                bucket_size_blocks=args.bucket_size_blocks,
             )
             torch.cuda.synchronize()
             for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
-                fast_grad = fast[name]
+                candidate_grad = candidate[name]
                 baseline_grad = baseline[name]
-                max_abs = (fast_grad.float() - baseline_grad.float()).abs().max().item()
+                max_abs = (candidate_grad.float() - baseline_grad.float()).abs().max().item()
                 torch.testing.assert_close(
-                    fast_grad.float(),
+                    candidate_grad.float(),
                     baseline_grad.float(),
                     atol=5e-2,
                     rtol=5e-2,
                 )
-                print(f"fast-path check {name}: max_abs={max_abs:.6g}", flush=True)
-            del fast, baseline
+                print(
+                    f"{args.bsa_causal_bwd_backend} backend check {name}: "
+                    f"max_abs={max_abs:.6g}",
+                    flush=True,
+                )
+            del candidate, baseline
 
         if case == "production" and args.verify_production_backend:
             candidate = backward()
@@ -207,30 +211,28 @@ def main():
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument(
         "--bsa-causal-bwd-backend",
-        choices=("blk64", "flex"),
-        default="flex",
+        choices=("blk64", "flex", "split"),
+        default=None,
         help=(
-            "Backward implementation for bsa-causal: the general 64x64 BSA "
-            "kernel or the exact block-causal Flex/FA4 fast path"
+            "Backward implementation for bsa-causal or production: the general "
+            "64x64 fused BSA kernel, the exact block-causal Flex/FA4 fast path, "
+            "or the exact Q-major split dQ path (defaults: bsa-causal=flex, "
+            "production=split; production does not support flex)"
         ),
     )
     parser.add_argument(
+        "--verify-bsa-causal-backend",
         "--verify-fastpath",
+        dest="verify_fastpath",
         action="store_true",
-        help="Compare the Flex block-causal backward with the blk64 baseline before timing",
-    )
-    parser.add_argument(
-        "--production-bwd-backend",
-        choices=("fused", "split"),
-        default="split",
-        help="Backward implementation for production: fused K-major or exact split Q-major dQ",
+        help="Compare the selected Flex/split bsa-causal backward with the blk64 baseline before timing",
     )
     parser.add_argument(
         "--qmajor-block-n",
         type=int,
         choices=(32, 64),
         default=32,
-        help="K-token sub-tile for the production split Q-major dQ kernel",
+        help="K-token sub-tile for the split Q-major dQ kernel",
     )
     parser.add_argument(
         "--bucket-size-blocks",
@@ -246,6 +248,31 @@ def main():
     peak.add_argument("--peak-tflops", type=float, help="Explicit per-GPU dense BF16 peak TFLOP/s")
     peak.add_argument("--clock-mhz", type=float, help="GB200/SM100 locked clock; derive peak from runtime SM count (does not lock clocks)")
     args = parser.parse_args()
+    if args.case == "causal":
+        if args.bsa_causal_bwd_backend is not None:
+            parser.error("--bsa-causal-bwd-backend applies only to --case bsa-causal or production")
+    elif args.bsa_causal_bwd_backend is None:
+        args.bsa_causal_bwd_backend = "flex" if args.case == "bsa-causal" else "split"
+    if args.case == "production" and args.bsa_causal_bwd_backend == "flex":
+        parser.error(
+            "the Flex backend supports only the exact block-causal-64 mask; "
+            "use blk64 or split for --case production"
+        )
+    if args.verify_fastpath:
+        if args.case != "bsa-causal":
+            parser.error("--verify-bsa-causal-backend requires --case bsa-causal")
+        if args.bsa_causal_bwd_backend == "blk64":
+            parser.error("blk64 is already the bsa-causal verification baseline")
+    if args.verify_production_backend and args.case != "production":
+        parser.error("--verify-production-backend requires --case production")
+    if args.verify_production_backend and args.bsa_causal_bwd_backend == "blk64":
+        parser.error("blk64 is already the production verification baseline")
+    if (
+        args.case == "bsa-causal"
+        and args.bsa_causal_bwd_backend == "flex"
+        and args.bucket_size_blocks is not None
+    ):
+        parser.error("--bucket-size-blocks does not apply to the Flex block-causal fast path")
     if args.seqlen <= 0 or args.warmup < 1 or args.runs < 1:
         parser.error("seqlen, warmup and runs must be positive")
     if args.peak_tflops is not None and not (0 < args.peak_tflops < float("inf")):
@@ -265,10 +292,16 @@ def main():
     print(f"{package}: {version(package)}; CUTLASS DSL: {version('nvidia-cutlass-dsl')}")
     print(f"BF16 BSHD, B={BATCH_SIZE} H={NUM_HEADS} D={HEAD_DIM}; median milliseconds; L2 flushed per sample")
     if args.case == "bsa-causal":
-        print(f"BSA causal backward backend: {args.bsa_causal_bwd_backend}")
+        suffix = (
+            f"; qmajor_block_n={args.qmajor_block_n}; "
+            f"bucket_size_blocks={args.bucket_size_blocks}"
+            if args.bsa_causal_bwd_backend == "split"
+            else ""
+        )
+        print(f"BSA causal backward backend: {args.bsa_causal_bwd_backend}{suffix}")
     if args.case == "production":
         print(
-            f"BSA production backward backend: {args.production_bwd_backend}; "
+            f"BSA production backward backend: {args.bsa_causal_bwd_backend}; "
             f"qmajor_block_n={args.qmajor_block_n}; bucket_size_blocks={args.bucket_size_blocks}"
         )
     if args.peak_tflops is not None:
