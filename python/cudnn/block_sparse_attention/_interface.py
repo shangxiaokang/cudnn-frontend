@@ -2061,6 +2061,8 @@ def bsa_attn_bwd(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    split_dq: bool = False,
+    qmajor_block_n: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for BSA block-sparse attention.
 
@@ -2091,6 +2093,9 @@ def bsa_attn_bwd(
             retain shape-based inference on SM100/SM110.
         layout: "bhsd" (default) or "bshd". Output gradients follow the same
             layout as the inputs.
+        split_dq: Use the SM100 exact block64 Q-major dQ kernel and suppress
+            per-edge global dQ reductions in the K-major kernel.
+        qmajor_block_n: K-token sub-tile used by the Q-major Triton kernel.
 
     Returns:
         (dq, dk, dv): Gradients w.r.t. q, k, v in the same layout as the inputs.
@@ -2103,6 +2108,8 @@ def bsa_attn_bwd(
           to FA4's SM100 128x128 backward kernel with BSA block-sparse metadata.
     """
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+    assert type(split_dq) is bool, "split_dq must be a bool"
+    assert qmajor_block_n in (32, 64), "qmajor_block_n must be 32 or 64"
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
 
@@ -2203,6 +2210,7 @@ def bsa_attn_bwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
+        assert not split_dq, "split_dq only supports the SM100 blk64 path"
         if bucket_size_blocks is None or bucket_size_blocks <= 0:
             bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(
                 num_q_blocks,
@@ -2256,6 +2264,8 @@ def bsa_attn_bwd(
         dk=dk_bwd,
         dv=dv_bwd,
         bucket_size_blocks=bucket_size_blocks,
+        split_dq=split_dq,
+        qmajor_block_n=qmajor_block_n,
     )
     if layout == "bshd":
         return (
@@ -2305,6 +2315,8 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
     bucket_size_blocks: Optional[int] = None,
+    split_dq: bool = False,
+    qmajor_block_n: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bucketed k2q CSR backward pass for BSA block-sparse attention.
 
@@ -2326,6 +2338,18 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     num_heads_kv, seqlen_k = k.shape[1], k.shape[2]
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "BSA bucketed k2q CSR bwd only supports SM90/SM100/SM110"
+    if split_dq:
+        assert arch in (100, 103), "split_dq currently requires SM100 or SM103"
+        assert qmajor_block_n in (32, 64), "qmajor_block_n must be 32 or 64"
+        from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_dq_qmajor_triton import (
+            qmajor_dq_available,
+        )
+
+        if not qmajor_dq_available():
+            raise RuntimeError(
+                "The split BSA backward backend requires Triton from the "
+                "PyTorch CUDA environment"
+            )
     if arch // 10 == 9:
         bwd_head_dim = SM90_BWD_HEAD_DIM
         sparse_block_size = SM90_BWD_SPARSE_BLOCK_SIZE
@@ -2476,7 +2500,9 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_q_to=8,
         round_k_to=8,
         round_d_to=8,
-        zero_dq_accum=True,
+        # The split backend writes dQ directly and never touches dQ_acc.
+        # Leave that field uninitialized and only zero the dK/dV accumulators.
+        zero_dq_accum=not split_dq,
         device=q.device,
     )
 
@@ -2485,6 +2511,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
     compile_key = (
         "sm100_bucketed_k2q",
+        split_dq,
         q.dtype,
         head_dim,
         sparse_block_size,
@@ -2526,6 +2553,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
+            compute_dq=not split_dq,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
@@ -2568,6 +2596,33 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             softmax_scale,
             current_stream,
         )
+
+    if split_dq:
+        from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_dq_qmajor_triton import (
+            bsa_dq_qmajor_triton,
+        )
+
+        q_rounded = ((seqlen_q + 7) // 8) * 8
+        neg_delta = workspace.reshape(-1)[: batch_size * num_heads * q_rounded].view(
+            batch_size, num_heads, q_rounded
+        )
+
+        with torch.cuda.nvtx.range("bsa_attn_bwd_dq_qmajor"):
+            bsa_dq_qmajor_triton(
+                dout,
+                q,
+                k,
+                v,
+                lse,
+                neg_delta,
+                q2k_block_index,
+                block_sparse_num,
+                block_sizes=block_sizes,
+                q2k_block_nums=q2k_block_nums,
+                softmax_scale=softmax_scale,
+                dq=dq,
+                block_n=qmajor_block_n,
+            )
 
     return dq, dk, dv
 

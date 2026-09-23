@@ -383,6 +383,8 @@ def block_sparse_attention_backward(
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
     block_causal: bool = False,
+    backward_backend: str = "fused",
+    qmajor_block_n: int = 32,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
@@ -396,6 +398,13 @@ def block_sparse_attention_backward(
     tail block from the tensor sequence length.  The flag is explicit because
     validating every metadata value on the host would synchronize the GPU and
     defeat the fast path.
+
+    Set ``backward_backend="split"`` for irregular 64-token masks on
+    SM100/SM103. The K-major CuTe kernel computes dK/dV without per-edge dQ
+    reductions, and an exact Q-major Triton kernel accumulates and writes dQ
+    once per Q64 block. ``qmajor_block_n`` selects its 32- or 64-token K
+    sub-tile. The split backend is explicit because its benefit depends on
+    sparse row geometry.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -412,6 +421,10 @@ def block_sparse_attention_backward(
 
     if type(block_causal) is not bool:
         raise TypeError("block_causal must be a bool")
+    if type(backward_backend) is not str or backward_backend not in ("fused", "split"):
+        raise ValueError("backward_backend must be 'fused' or 'split'")
+    if type(qmajor_block_n) is not int or qmajor_block_n not in {32, 64}:
+        raise ValueError("qmajor_block_n must be 32 or 64")
     if sparse_block_size is None:
         sparse_block_size = 64 if block_causal or arch_family == 9 else 128
     if sparse_block_size not in {64, 128}:
@@ -425,6 +438,8 @@ def block_sparse_attention_backward(
     if sparse_block_size == 128 and block_sizes is not None:
         raise NotImplementedError("SM100/SM110 blk128 backward does not yet support block_sizes; " "use full physical KV blocks and pass block_sizes=None")
     if block_causal:
+        if backward_backend != "fused":
+            raise ValueError("block_causal uses its own fast path; backward_backend must be 'fused'")
         if arch not in {100, 103}:
             raise NotImplementedError("block_causal fast path currently requires SM100 or SM103")
         if sparse_block_size != 64:
@@ -440,6 +455,11 @@ def block_sparse_attention_backward(
             )
         if bucket_size_blocks is not None:
             raise ValueError("bucket_size_blocks does not apply to the block_causal fast path")
+    elif backward_backend == "split":
+        if arch not in {100, 103}:
+            raise NotImplementedError("split BSA backward currently requires SM100 or SM103")
+        if sparse_block_size != 64 or head_dim != 128:
+            raise NotImplementedError("split BSA backward requires sparse_block_size=64 and head_dim=128")
 
     expected_prefix = (
         batch,
@@ -517,6 +537,8 @@ def block_sparse_attention_backward(
             bucket_size_blocks=bucket_size_blocks,
             sparse_block_size=sparse_block_size,
             layout=layout,
+            split_dq=backward_backend == "split",
+            qmajor_block_n=qmajor_block_n,
         )
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
 

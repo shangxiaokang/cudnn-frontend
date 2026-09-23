@@ -226,6 +226,18 @@ match. `block_sizes` must be `None`; the natural final partial block is derived
 from the actual Q/K sequence length. `bucket_size_blocks` does not apply to this route.
 The ordinary blk64 path remains the default for arbitrary sparse metadata.
 
+For irregular block64 masks on SM100/SM103, callers can explicitly select
+`backward_backend="split"`. This keeps dK/dV on the bucketed K-major CuTe
+kernel and computes dQ with an exact Q-major Triton kernel that directly
+traverses each `q2k_block_index` active prefix. The latter accumulates one
+Q64 gradient in FP32 and writes it once, instead of globally reducing one dQ
+partial per sparse edge. Both `q2k_block_nums` and partial `block_sizes` are
+supported. `qmajor_block_n` selects a 32- or 64-token K sub-tile; 32 is the
+default. This route requires BF16, head dimension 128, sparse block size 64,
+Triton, and SM100/SM103. It is opt-in because performance depends on sparse
+row length and because the fused kernel remains preferable for some small
+or regular masks.
+
 ## Current support
 
 ### Forward

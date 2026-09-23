@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ $# != 1 || "$1" == --help ]]; then
     echo 'Usage: bash run_all.sh CLOCK_MHZ'
     echo 'Example: GPU=0 bash run_all.sh 2032'
-    echo 'Optional: WARMUP=5 RUNS=10 BSA_CAUSAL_BWD_BACKEND=flex|blk64 BSA_PYTHON=... CAUSAL_PYTHON=... LOG_DIR=...'
+    echo 'Optional: WARMUP=5 RUNS=10 BSA_CAUSAL_BWD_BACKEND=flex|blk64 PRODUCTION_BWD_BACKEND=split|fused QMAJOR_BLOCK_N=32|64 BUCKET_SIZE_BLOCKS=...'
     [[ "${1:-}" == --help ]] && exit 0
     exit 2
 fi
@@ -17,6 +17,9 @@ GPU="${GPU:-0}"
 WARMUP="${WARMUP:-5}"
 RUNS="${RUNS:-10}"
 BSA_CAUSAL_BWD_BACKEND="${BSA_CAUSAL_BWD_BACKEND:-flex}"
+PRODUCTION_BWD_BACKEND="${PRODUCTION_BWD_BACKEND:-split}"
+QMAJOR_BLOCK_N="${QMAJOR_BLOCK_N:-32}"
+BUCKET_SIZE_BLOCKS="${BUCKET_SIZE_BLOCKS:-}"
 BSA_PYTHON="${BSA_PYTHON:-$SCRIPT_DIR/.venv/bsa/bin/python}"
 CAUSAL_PYTHON="${CAUSAL_PYTHON:-$SCRIPT_DIR/.venv/causal/bin/python}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/results/locked_$(date +%Y%m%d_%H%M%S)_$$}"
@@ -52,7 +55,15 @@ if [[ "$BSA_CAUSAL_BWD_BACKEND" != "blk64" && "$BSA_CAUSAL_BWD_BACKEND" != "flex
     echo "BSA_CAUSAL_BWD_BACKEND must be blk64 or flex" >&2
     exit 2
 fi
-echo "GPU=$GPU CLOCK_MHZ=$CLOCK_MHZ WARMUP=$WARMUP RUNS=$RUNS BSA_CAUSAL_BWD_BACKEND=$BSA_CAUSAL_BWD_BACKEND" | tee "$LOG_DIR/config.log"
+if [[ "$PRODUCTION_BWD_BACKEND" != "fused" && "$PRODUCTION_BWD_BACKEND" != "split" ]]; then
+    echo "PRODUCTION_BWD_BACKEND must be fused or split" >&2
+    exit 2
+fi
+if [[ "$QMAJOR_BLOCK_N" != "32" && "$QMAJOR_BLOCK_N" != "64" ]]; then
+    echo "QMAJOR_BLOCK_N must be 32 or 64" >&2
+    exit 2
+fi
+echo "GPU=$GPU CLOCK_MHZ=$CLOCK_MHZ WARMUP=$WARMUP RUNS=$RUNS BSA_CAUSAL_BWD_BACKEND=$BSA_CAUSAL_BWD_BACKEND PRODUCTION_BWD_BACKEND=$PRODUCTION_BWD_BACKEND QMAJOR_BLOCK_N=$QMAJOR_BLOCK_N BUCKET_SIZE_BLOCKS=${BUCKET_SIZE_BLOCKS:-auto}" | tee "$LOG_DIR/config.log"
 echo "BSA_PYTHON=$BSA_PYTHON CAUSAL_PYTHON=$CAUSAL_PYTHON" | tee -a "$LOG_DIR/config.log"
 nvidia-smi -i "$GPU" -q > "$LOG_DIR/gpu_before.log"
 # A lock failure stops the run before any benchmark is launched.
@@ -78,6 +89,11 @@ for case in causal bsa-causal production; do
     case_args=()
     if [[ "$case" == bsa-causal ]]; then
         case_args+=(--bsa-causal-bwd-backend "$BSA_CAUSAL_BWD_BACKEND")
+    elif [[ "$case" == production ]]; then
+        case_args+=(--production-bwd-backend "$PRODUCTION_BWD_BACKEND" --qmajor-block-n "$QMAJOR_BLOCK_N")
+        if [[ -n "$BUCKET_SIZE_BLOCKS" ]]; then
+            case_args+=(--bucket-size-blocks "$BUCKET_SIZE_BLOCKS")
+        fi
     fi
     echo "Running $case"
     "$case_python" -u benchmark.py --case "$case" --clock-mhz "$CLOCK_MHZ" --warmup "$WARMUP" --runs "$RUNS" "${case_args[@]}" 2>&1 | tee "$LOG_DIR/$case.log"

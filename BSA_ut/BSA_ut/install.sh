@@ -52,6 +52,7 @@ from importlib.metadata import version
 from inspect import signature
 
 import torch
+import triton
 import cutlass.cute as cute
 import cudnn
 from cudnn import BSA
@@ -60,7 +61,11 @@ assert hasattr(cute, "make_fragment_like")
 assert "block_causal" in signature(
     BSA.block_sparse_attention_backward
 ).parameters, "installed cuDNN Frontend does not contain the local BSA optimization"
+assert "backward_backend" in signature(
+    BSA.block_sparse_attention_backward
+).parameters, "installed cuDNN Frontend does not contain the production split backend"
 print("Torch:", torch.__version__, torch.__file__)
+print("Triton:", triton.__version__)
 print("nvidia-cutlass-dsl:", version("nvidia-cutlass-dsl"))
 print("cuDNN Frontend:", version("nvidia-cudnn-frontend"))
 print("cuDNN:", cudnn.__file__)

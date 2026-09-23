@@ -128,6 +128,38 @@ audio 可见 text 和自身 audio。10% 是视频候选块比例，不是整个 
 视频按 `1×8×8` cube 排列，每块有效 token 前置。Top-K 按有效 token 的 Q/K block mean 打分，
 同分优先较小块编号。输入为合成数据，Q/K/V seed=0、dO seed=1，输入 padding 和 padded query 的 dO 清零。
 
+## Production split backward
+
+The production benchmark defaults to the exact block64 split backward:
+K-major CuTe computes dK/dV, while Q-major Triton accumulates dQ once per
+Q64 row. Compare it with the fused baseline and validate all gradients before
+accepting a performance result:
+
+```bash
+# Correctness gate on the full production fixture
+.venv/bsa/bin/python -u benchmark.py --case production --warmup 2 --runs 10 \
+  --production-bwd-backend split --qmajor-block-n 32 \
+  --verify-production-backend
+
+# Locked-clock A/B (run_all defaults to split)
+PRODUCTION_BWD_BACKEND=fused GPU=0 bash run_all.sh 2032
+PRODUCTION_BWD_BACKEND=split QMAJOR_BLOCK_N=32 GPU=0 bash run_all.sh 2032
+
+# dK/dV bucket and Q-major sub-tile sweep
+for bucket in 512 1024 2048 3991; do
+  .venv/bsa/bin/python -u benchmark.py --case production --warmup 5 --runs 20 \
+    --clock-mhz 2032 --production-bwd-backend split \
+    --qmajor-block-n 32 --bucket-size-blocks "$bucket"
+done
+```
+
+`masks.py` compacts the inactive q2k suffix after Top-K construction. This
+does not change the mask; it reduces CSR planning storage and scan work.
+The first split invocation JIT-compiles both CuTe and Triton kernels, so keep
+warmup enabled. The reported backward TFLOP/s remains the standard effective
+five-matmul (10D per visible pair) convention even though split recomputes
+QK/dP/dS in its separate dQ kernel.
+
 ## Profiling
 
 安装 NVIDIA Nsight Compute 后，可仅采集生产用例的一次反向：

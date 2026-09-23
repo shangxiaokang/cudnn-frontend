@@ -34,7 +34,12 @@ def block_sparse_mask(
                 for slot in range(count):
                     kv_block = int(q2k_block_index[b, h, q_block, slot])
                     k_start = kv_block * block_size
-                    k_end = min(k_start + int(block_sizes[kv_block]), seqlen_k)
+                    block_size_k = (
+                        block_sizes[kv_block]
+                        if block_sizes.ndim == 1
+                        else block_sizes[b, kv_block]
+                    )
+                    k_end = min(k_start + int(block_size_k), seqlen_k)
                     mask[b, h, q_start:q_end, k_start:k_end] = 0.0
     return mask
 

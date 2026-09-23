@@ -155,12 +155,16 @@ def build_cube_mask(q, k, geometry):
 
 def build_bsa_metadata(q, k, geometry):
     cube_mask = build_cube_mask(q, k, geometry)
-    # Each row keeps all M block IDs: sorted active IDs form the prefix;
-    # q2k_block_nums gives its length. The remaining IDs are ignored by BSA.
+    # Sorted active IDs form the prefix and q2k_block_nums gives its length.
+    # Retaining the full M-wide inactive suffix makes the GPU CSR builder scan
+    # and allocate O(M^2) storage. Production's maximum active count is much
+    # smaller, so compact the physical capacity once, outside timed execution.
     q2k_block_index = cube_mask.argsort(dim=-1, descending=True, stable=True).to(
         torch.int32
     )
     q2k_block_nums = cube_mask.sum(dim=-1, dtype=torch.int32)
+    active_capacity = max(1, int(q2k_block_nums.max().item()))
+    q2k_block_index = q2k_block_index[..., :active_capacity].contiguous()
     return {
         "q2k_block_index": q2k_block_index,
         "q2k_block_nums": q2k_block_nums,

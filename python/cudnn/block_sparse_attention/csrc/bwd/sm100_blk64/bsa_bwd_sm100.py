@@ -38,9 +38,13 @@ class BlockSparseAttnBackwardSm100Blk64:
         self,
         sparse_block_size: int,
         has_block_sizes: bool = True,
+        compute_dq: bool = True,
     ):
         self.sparse_block_size = sparse_block_size
         self.has_block_sizes = has_block_sizes
+        # False is used by the split production backend: this kernel computes
+        # dK/dV while a Q-major kernel writes the final dQ.
+        self.compute_dq = compute_dq
 
         self.QK_mma_tiler = (128, 64, 128)
         self.fake_QK_mma_tiler = (64, 64, 128)
@@ -60,19 +64,29 @@ class BlockSparseAttnBackwardSm100Blk64:
         self.sum_OdO_num_threads_q = self.sum_OdO_max_threads_per_block // self.sum_OdO_num_threads_d
         self.sum_OdO_elem_per_load = 2
 
-        self.reduce_warp_id = (0, 1, 2, 3)
-        self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
-        self.mma_warp_id = 12
-        self.load_warp_id = 13
-
         self.num_reduce_warps = 4
         self.num_compute_warps = 8
 
+        if self.compute_dq:
+            self.reduce_warp_id = (0, 1, 2, 3)
+            self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
+            self.mma_warp_id = 12
+            self.load_warp_id = 13
+        else:
+            # dKV-only does not launch the four dQ reducer warps. Keep the
+            # pipeline's compile-time reduce group width non-zero, but pack the
+            # live roles into two compute warpgroups plus MMA/load warps.
+            self.reduce_warp_id = ()
+            self.compute_warp_id = (0, 1, 2, 3, 4, 5, 6, 7)
+            self.mma_warp_id = 8
+            self.load_warp_id = 9
+
         SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.threads_per_warp = 32
-        self.threads_per_cta = self.threads_per_warp * (self.num_reduce_warps + self.num_compute_warps + 4)
+        self.threads_per_cta = self.threads_per_warp * (
+            self.num_compute_warps + 4 + (self.num_reduce_warps if self.compute_dq else 0)
+        )
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
@@ -80,7 +94,12 @@ class BlockSparseAttnBackwardSm100Blk64:
         )
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2,
-            num_threads=self.threads_per_warp * (self.num_compute_warps + 1 + self.num_reduce_warps),
+            num_threads=self.threads_per_warp
+            * (
+                self.num_compute_warps
+                + 1
+                + (self.num_reduce_warps if self.compute_dq else 0)
+            ),
         )
         self.compute_sync_barrier = pipeline.NamedBarrier(
             barrier_id=3,
@@ -97,19 +116,26 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         self.tmem_dK_offset = 0
         self.tmem_dV_offset = self.tmem_dK_offset + self.QdS_mma_tiler[1]  # 64
-        self.tmem_dQ_offset = self.tmem_dV_offset + self.dOP_mma_tiler[1]  # 64 + 64 = 128
         self.tmem_dQ_stage_count = 2
         self.tmem_dQ_stage_stride = self.dSK_mma_tiler[1]  # 128 columns per dQ stage
-        self.tmem_S_offset = (
-            self.tmem_dQ_offset + self.tmem_dQ_stage_count * self.tmem_dQ_stage_stride
-        )  # 128 + 2 * 128 = 384
-        # Keep dP independent from dQ.  When they alias, the MMA warp must wait
-        # for the reduction warps to finish moving every dQ tile out of TMEM
-        # before it can issue the next dP MMA.  The kernel allocates all 512
-        # SM100 TMEM columns.  Double-buffer dQ in [128, 384), then use
-        # [384, 448) for S and [448, 512) for dP.
-        self.tmem_dP_offset = self.tmem_S_offset + self.QK_mma_tiler[1]  # 384 + 64 = 448
+        if self.compute_dq:
+            self.tmem_dQ_offset = self.tmem_dV_offset + self.dOP_mma_tiler[1]
+            self.tmem_S_offset = (
+                self.tmem_dQ_offset
+                + self.tmem_dQ_stage_count * self.tmem_dQ_stage_stride
+            )
+            self.tmem_dP_offset = self.tmem_S_offset + self.QK_mma_tiler[1]
+            self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        else:
+            # dK [0,64), dV [64,128), S [128,192), dP [192,256).
+            # The unused dQ fragment is based at zero solely to preserve the
+            # shared MMA call signature without addressing outside allocation.
+            self.tmem_dQ_offset = 0
+            self.tmem_S_offset = self.tmem_dV_offset + self.dOP_mma_tiler[1]
+            self.tmem_dP_offset = self.tmem_S_offset + self.QK_mma_tiler[1]
+            self.tmem_alloc_cols = 256
         assert self.tmem_dP_offset + self.dOV_mma_tiler[1] <= self.tmem_alloc_cols
+        assert self.tmem_alloc_cols <= SM100_TMEM_CAPACITY_COLUMNS
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -395,6 +421,12 @@ class BlockSparseAttnBackwardSm100Blk64:
             self.acc_dtype,
         )
         dQ_smem_layout_staged = cute.tile_to_shape(dQ_smem_layout_atom, (self.QK_mma_tiler[0], 32, self.reduce_tma_store_stage), order=(1, 0, 2))
+        # The split dKV specialization has no dQ reducer. Retain a one-element
+        # typed placeholder so the common kernel signature stays stable while
+        # releasing the reducer's ~32 KiB shared-memory backing.
+        dQ_smem_storage_elements = (
+            cute.cosize(dQ_smem_layout_staged) if self.compute_dq else 1
+        )
         fake_dQ_smem_layout_atom = sm100_utils.make_smem_layout_atom(
             sm100_utils.get_smem_layout_atom_ab(
                 OperandMajorMode.K,
@@ -491,7 +523,7 @@ class BlockSparseAttnBackwardSm100Blk64:
                 self.buffer_align_bytes,
             ]
             sdQ: cute.struct.Align[
-                cute.struct.MemRange[self.acc_dtype, cute.cosize(dQ_smem_layout_staged)],
+                cute.struct.MemRange[self.acc_dtype, dQ_smem_storage_elements],
                 self.buffer_align_bytes,
             ]
             sLSE: cute.struct.Align[
@@ -955,34 +987,37 @@ class BlockSparseAttnBackwardSm100Blk64:
                     )
                     cute.arch.dealloc_tmem(tmem_ptr, self.tmem_alloc_cols)
             elif warp_idx in self.reduce_warp_id:
-                cute.arch.setmaxregister_increase(self.num_regs_reduce)
+                if cutlass.const_expr(self.compute_dq):
+                    cute.arch.setmaxregister_increase(self.num_regs_reduce)
 
-                tmem.wait_for_alloc()
-                # Retrieve tmem ptr
-                tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
+                    tmem.wait_for_alloc()
+                    # Retrieve tmem ptr
+                    tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
-                tdQtdQ_shape = dSK_tiled_mma.partition_shape_C(cute.select(self.dSK_mma_tiler, mode=[0, 1]))
-                tdQtdQ = dSK_tiled_mma.make_fragment_C(tdQtdQ_shape)
-                tdQtdQ_layout_staged = cute.append(
-                    tdQtdQ.layout,
-                    cute.make_layout(
-                        self.mma_reduce_dQ_stage,
-                        stride=self.tmem_dQ_stage_stride,
-                    ),
-                )
-                tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ_layout_staged)
+                    tdQtdQ_shape = dSK_tiled_mma.partition_shape_C(cute.select(self.dSK_mma_tiler, mode=[0, 1]))
+                    tdQtdQ = dSK_tiled_mma.make_fragment_C(tdQtdQ_shape)
+                    tdQtdQ_layout_staged = cute.append(
+                        tdQtdQ.layout,
+                        cute.make_layout(
+                            self.mma_reduce_dQ_stage,
+                            stride=self.tmem_dQ_stage_stride,
+                        ),
+                    )
+                    tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ_layout_staged)
 
-                self.reduce(
-                    problem_shape,
-                    tdQtdQ,
-                    bucketed_k2q_indices,
-                    k2q_begin,
-                    tma_atom_dQ_acc,
-                    dQ_acc,
-                    sdQ,
-                    reduce_iter_count,
-                    (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline),
-                )
+                    self.reduce(
+                        problem_shape,
+                        tdQtdQ,
+                        bucketed_k2q_indices,
+                        k2q_begin,
+                        tma_atom_dQ_acc,
+                        dQ_acc,
+                        sdQ,
+                        reduce_iter_count,
+                        (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline),
+                    )
+                else:
+                    cute.arch.setmaxregister_decrease(self.num_regs_empty)
             else:
                 cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
@@ -1006,7 +1041,7 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         for idx_s_t in cutlass.range(tidy, self.block_seq, self.num_threads_seq):
             idx_s = idx_s_t + self.block_seq * seq_tile_idx
-            if idx_s < q_count:
+            if cutlass.const_expr(self.compute_dq) and idx_s < q_count:
                 dQ_acc_bhs = dQ_acc[idx_s, None, (h_idx, b_idx)]
                 dQ_acc_bhs = cute.logical_divide(dQ_acc_bhs, cute.make_layout(self.convert_elem_per_load))
                 dQ_bhs = dQ[idx_s, None, (h_idx, b_idx)]
@@ -1631,17 +1666,24 @@ class BlockSparseAttnBackwardSm100Blk64:
             compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state)
 
             mma_compute_dP_pipeline.producer_acquire(mma_compute_dP_producer_state)
-            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
+            if cutlass.const_expr(self.compute_dq):
+                mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
 
-            # dQ = dS * K
-            tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
-            dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
-                cute.gemm(dSK_tiled_mma, tdQtdQ_cur, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ_cur)
-                dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                # dQ = dS * K
+                tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
+                dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
+                    cute.gemm(
+                        dSK_tiled_mma,
+                        tdQtdQ_cur,
+                        tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tdQrKT[None, None, k_block, 0],
+                        tdQtdQ_cur,
+                    )
+                    dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-            mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
-            mma_reduce_dQ_producer_state.advance()
+                mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
+                mma_reduce_dQ_producer_state.advance()
 
             # dK = Q * dS
             for k_block in cutlass.range(0, cute.size(tdKTrQT, mode=[2]), unroll_full=True):
@@ -1720,19 +1762,26 @@ class BlockSparseAttnBackwardSm100Blk64:
         mma_compute_dKdV_pipeline.producer_commit(mma_compute_dKdV_producer_state)
         mma_compute_dKdV_producer_state.advance()
 
-        # dQ = dS * K
-        # dP has a dedicated TMEM range, so the reduction warps can drain the
-        # preceding dQ while the MMA warp issues S/dP/dV.  Wait only when the
-        # next dQ tile is about to reuse the stage selected by the producer state.
-        mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
-        tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
-        dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
-            cute.gemm(dSK_tiled_mma, tdQtdQ_cur, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ_cur)
-            dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.compute_dq):
+            # dQ = dS * K
+            # dP has a dedicated TMEM range, so the reduction warps can drain the
+            # preceding dQ while the MMA warp issues S/dP/dV. Wait only when the
+            # next dQ tile is about to reuse the selected producer stage.
+            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
+            tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
+            dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
+                cute.gemm(
+                    dSK_tiled_mma,
+                    tdQtdQ_cur,
+                    tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
+                    tdQrKT[None, None, k_block, 0],
+                    tdQtdQ_cur,
+                )
+                dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-        mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
-        mma_reduce_dQ_producer_state.advance()
+            mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
+            mma_reduce_dQ_producer_state.advance()
 
         load_mma_Q_pipeline.consumer_release(load_mma_Q_release_state)
         load_mma_Q_release_state.advance()

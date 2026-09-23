@@ -154,6 +154,102 @@ def test_bsa_attention_backward_sm100_blk64(num_q_blocks):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+@pytest.mark.parametrize("qmajor_block_n", [32, 64])
+def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
+        pytest.skip("split blk64 backward is specific to SM100/SM103")
+    pytest.importorskip("triton")
+
+    BSA = _import_bsa()
+    block_size = 64
+    batch, heads, blocks, dim = 2, 2, 5, 128
+    seqlen = blocks * block_size
+    q, k, v = [
+        torch.randn((batch, seqlen, heads, dim), device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    do = torch.randn_like(q)
+
+    # Head-specific rows and a capacity larger than several active prefixes
+    # exercise runtime counts, odd tails, and arbitrary (not causal) ordering.
+    q2k = torch.zeros((batch, heads, blocks, blocks), dtype=torch.int32, device="cuda")
+    counts = torch.tensor(
+        [[[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]]],
+        dtype=torch.int32,
+        device="cuda",
+    ).expand(batch, -1, -1).contiguous()
+    ids = torch.arange(blocks, dtype=torch.int32, device="cuda")
+    for batch_idx in range(batch):
+        for row in range(blocks):
+            q2k[batch_idx, 0, row, : row + 1] = ids.roll(batch_idx).flip(0)[: row + 1]
+            q2k[batch_idx, 1, row, : blocks - row] = ids.roll(row + batch_idx)[: blocks - row]
+    block_sizes = torch.tensor(
+        [[64, 30, 48, 40, 13], [55, 64, 23, 48, 32]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    mask = block_sparse_mask(
+        q2k,
+        blocks,
+        block_sizes,
+        seqlen,
+        seqlen,
+        block_size,
+        q2k_block_nums=counts,
+    )
+    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        do.transpose(1, 2),
+        mask,
+    )
+
+    forward = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        blocks,
+        block_sizes,
+        q2k_block_nums=counts,
+        sparse_block_size=block_size,
+        layout="bshd",
+        use_clc=False,
+    )
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    backward = BSA.block_sparse_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        forward["o_tensor"],
+        forward["lse_tensor"],
+        q2k,
+        blocks,
+        block_sizes,
+        q2k_block_nums=counts,
+        dq_tensor=dq,
+        dk_tensor=dk,
+        dv_tensor=dv,
+        sparse_block_size=block_size,
+        layout="bshd",
+        backward_backend="split",
+        qmajor_block_n=qmajor_block_n,
+    )
+    assert backward["dq_tensor"].data_ptr() == dq.data_ptr()
+    assert backward["dk_tensor"].data_ptr() == dk.data_ptr()
+    assert backward["dv_tensor"].data_ptr() == dv.data_ptr()
+    torch.testing.assert_close(dq.transpose(1, 2).float(), dq_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dk.transpose(1, 2).float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dv.transpose(1, 2).float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=13)
 @pytest.mark.parametrize("seqlen", [160, 192])
 def test_bsa_attention_backward_block_causal_64_fastpath(seqlen):

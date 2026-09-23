@@ -96,6 +96,9 @@ def run_case(case, args, flush):
             case == "bsa-causal"
             and args.bsa_causal_bwd_backend == "flex"
         )
+        production_backend = (
+            args.production_bwd_backend if case == "production" else "fused"
+        )
         # The exact fast path derives the natural tail block from S.  Keep the
         # block_sizes tensor for forward/FLOP accounting and omit it only from
         # this backward call so arbitrary ragged metadata cannot be ignored.
@@ -110,6 +113,9 @@ def run_case(case, args, flush):
                 do, q, k, v, out, lse, **backward_metadata,
                 sparse_block_size=64, layout="bshd",
                 block_causal=use_block_causal_fastpath,
+                backward_backend=production_backend,
+                qmajor_block_n=args.qmajor_block_n,
+                bucket_size_blocks=args.bucket_size_blocks,
             )
 
         if (
@@ -143,6 +149,35 @@ def run_case(case, args, flush):
                 )
                 print(f"fast-path check {name}: max_abs={max_abs:.6g}", flush=True)
             del fast, baseline
+
+        if case == "production" and args.verify_production_backend:
+            candidate = backward()
+            baseline = BSA.block_sparse_attention_backward(
+                do,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                **metadata,
+                sparse_block_size=64,
+                layout="bshd",
+                backward_backend="fused",
+                bucket_size_blocks=args.bucket_size_blocks,
+            )
+            torch.cuda.synchronize()
+            for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+                candidate_grad = candidate[name]
+                baseline_grad = baseline[name]
+                max_abs = (candidate_grad.float() - baseline_grad.float()).abs().max().item()
+                torch.testing.assert_close(
+                    candidate_grad.float(),
+                    baseline_grad.float(),
+                    atol=5e-2,
+                    rtol=5e-2,
+                )
+                print(f"production backend check {name}: max_abs={max_abs:.6g}", flush=True)
+            del candidate, baseline
 
     fwd_ms = measure(forward, f"BSA_ut__{case}__fwd", args.warmup, args.runs, flush)
     bwd_ms = measure(backward, f"BSA_ut__{case}__bwd", args.warmup, args.runs, flush)
@@ -184,6 +219,29 @@ def main():
         action="store_true",
         help="Compare the Flex block-causal backward with the blk64 baseline before timing",
     )
+    parser.add_argument(
+        "--production-bwd-backend",
+        choices=("fused", "split"),
+        default="split",
+        help="Backward implementation for production: fused K-major or exact split Q-major dQ",
+    )
+    parser.add_argument(
+        "--qmajor-block-n",
+        type=int,
+        choices=(32, 64),
+        default=32,
+        help="K-token sub-tile for the production split Q-major dQ kernel",
+    )
+    parser.add_argument(
+        "--bucket-size-blocks",
+        type=int,
+        help="Override the blk64 dK/dV bucket size (try 512/1024/2048/3991)",
+    )
+    parser.add_argument(
+        "--verify-production-backend",
+        action="store_true",
+        help="Compare the selected production backend with fused blk64 before timing",
+    )
     peak = parser.add_mutually_exclusive_group()
     peak.add_argument("--peak-tflops", type=float, help="Explicit per-GPU dense BF16 peak TFLOP/s")
     peak.add_argument("--clock-mhz", type=float, help="GB200/SM100 locked clock; derive peak from runtime SM count (does not lock clocks)")
@@ -208,6 +266,11 @@ def main():
     print(f"BF16 BSHD, B={BATCH_SIZE} H={NUM_HEADS} D={HEAD_DIM}; median milliseconds; L2 flushed per sample")
     if args.case == "bsa-causal":
         print(f"BSA causal backward backend: {args.bsa_causal_bwd_backend}")
+    if args.case == "production":
+        print(
+            f"BSA production backward backend: {args.production_bwd_backend}; "
+            f"qmajor_block_n={args.qmajor_block_n}; bucket_size_blocks={args.bucket_size_blocks}"
+        )
     if args.peak_tflops is not None:
         print(f"Single-GPU dense BF16 peak: {args.peak_tflops:.3f} TFLOP/s")
     print("Bwd TFLOP/s and MFU include QK recompute (10*D*pairs); fwd uses 4*D*pairs")
