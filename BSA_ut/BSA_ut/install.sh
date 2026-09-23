@@ -4,7 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-CUDNN_DIR="$SCRIPT_DIR/cudnn-frontend"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+# When BSA_ut lives inside a cudnn-frontend checkout, install that checkout so
+# local kernel edits are actually benchmarked.  The standalone bundle keeps
+# the historical nested-clone behavior.  CUDNN_DIR remains an explicit
+# override for remote-node layouts.
+if [[ -z "${CUDNN_DIR:-}" ]]; then
+    if [[ -d "$REPO_ROOT/.git" && -f "$REPO_ROOT/pyproject.toml" && -d "$REPO_ROOT/python/cudnn/block_sparse_attention" ]]; then
+        CUDNN_DIR="$REPO_ROOT"
+    else
+        CUDNN_DIR="$SCRIPT_DIR/cudnn-frontend"
+    fi
+fi
 CUDNN_URL="https://github.com/NVIDIA/cudnn-frontend.git"
 CUDNN_TAG="v1.29.0"
 CUDNN_COMMIT="91dbf3e976a161c1a6833198c708a449330dc3ce"
@@ -34,17 +45,21 @@ export CUDNN_PATH
 CUDNN_PATH="$(python -c 'from importlib.metadata import distribution; print(distribution("nvidia-cudnn-cu13").locate_file("nvidia/cudnn"))')"
 unset CUDNN_INCLUDE_PATH CUDNN_LIBRARY_PATH
 export CMAKE_PREFIX_PATH="$(python -c 'import sys; print(sys.prefix)')"
-python -m pip install --no-build-isolation --no-deps "$CUDNN_DIR"
+python -m pip install --force-reinstall --no-build-isolation --no-deps "$CUDNN_DIR"
 
 python - <<'CHECK'
 from importlib.metadata import version
+from inspect import signature
 
 import torch
 import cutlass.cute as cute
 import cudnn
 from cudnn import BSA
 
-cute.make_fragment
+assert hasattr(cute, "make_fragment_like")
+assert "block_causal" in signature(
+    BSA.block_sparse_attention_backward
+).parameters, "installed cuDNN Frontend does not contain the local BSA optimization"
 print("Torch:", torch.__version__, torch.__file__)
 print("nvidia-cutlass-dsl:", version("nvidia-cutlass-dsl"))
 print("cuDNN Frontend:", version("nvidia-cudnn-frontend"))

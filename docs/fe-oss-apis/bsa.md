@@ -214,6 +214,18 @@ explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
 path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
 therefore requires full physical KV blocks and `block_sizes=None`.
 
+For the exact 64-token block-causal pattern
+`floor(k / 64) <= floor(q / 64)`, SM100/SM103 callers may pass
+`block_causal=True` together with `sparse_block_size=64` and
+`q2k_block_nums`. This reuses a cached packed-mask plan and the 128x128-per-CTA
+cooperative 2-CTA backward kernel; all off-diagonal tiles are full and only the upper-right
+64x64 quadrant of each diagonal tile is masked. The caller certifies that the
+supplied sparse metadata has this exact pattern: the wrapper deliberately does
+not read GPU metadata back to the host for validation. `S_q` and `S_k` must
+match. `block_sizes` must be `None`; the natural final partial block is derived
+from the actual Q/K sequence length. `bucket_size_blocks` does not apply to this route.
+The ordinary blk64 path remains the default for arbitrary sparse metadata.
+
 ## Current support
 
 ### Forward

@@ -382,11 +382,20 @@ def block_sparse_attention_backward(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    block_causal: bool = False,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+
+    Set ``block_causal=True`` only when the supplied 64-token metadata exactly
+    represents ``floor(k / 64) <= floor(q / 64)``.  On SM100/SM103 this uses
+    the packed-mask 128x128 backward kernel while preserving that predicate
+    exactly.  This route requires ``block_sizes=None``; it derives the natural
+    tail block from the tensor sequence length.  The flag is explicit because
+    validating every metadata value on the host would synchronize the GPU and
+    defeat the fast path.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -401,8 +410,10 @@ def block_sparse_attention_backward(
     if head_dim != value_dim:
         raise NotImplementedError("block sparse attention backward requires equal QK and V dimensions")
 
+    if type(block_causal) is not bool:
+        raise TypeError("block_causal must be a bool")
     if sparse_block_size is None:
-        sparse_block_size = 64 if arch_family == 9 else 128
+        sparse_block_size = 64 if block_causal or arch_family == 9 else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
     if arch_family == 9 and sparse_block_size != 64:
@@ -413,6 +424,22 @@ def block_sparse_attention_backward(
         raise NotImplementedError("SM100/SM110 blk128 backward requires head_dim=64 or 128")
     if sparse_block_size == 128 and block_sizes is not None:
         raise NotImplementedError("SM100/SM110 blk128 backward does not yet support block_sizes; " "use full physical KV blocks and pass block_sizes=None")
+    if block_causal:
+        if arch not in {100, 103}:
+            raise NotImplementedError("block_causal fast path currently requires SM100 or SM103")
+        if sparse_block_size != 64:
+            raise ValueError("block_causal fast path requires sparse_block_size=64")
+        if seqlen_q != seqlen_k:
+            raise ValueError("block_causal fast path requires equal Q and K sequence lengths")
+        if q2k_block_nums is None:
+            raise ValueError("block_causal fast path requires q2k_block_nums")
+        if block_sizes is not None:
+            raise ValueError(
+                "block_causal fast path requires block_sizes=None; sequence tails "
+                "are derived from the Q/K tensor shapes"
+            )
+        if bucket_size_blocks is not None:
+            raise ValueError("bucket_size_blocks does not apply to the block_causal fast path")
 
     expected_prefix = (
         batch,
@@ -453,6 +480,23 @@ def block_sparse_attention_backward(
     )
 
     with torch.cuda.device(q_tensor.device):
+        if block_causal:
+            from ._block_causal_fastpath import block_causal_64_backward
+
+            return block_causal_64_backward(
+                do_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale=softmax_scale,
+                dq_tensor=dq_tensor,
+                dk_tensor=dk_tensor,
+                dv_tensor=dv_tensor,
+                layout=layout,
+            )
+
         from . import _interface
 
         dq, dk, dv = _interface.bsa_attn_bwd(

@@ -92,11 +92,57 @@ def run_case(case, args, flush):
             # Padded query outputs are discarded by production's gather.
             do.masked_fill_(~valid, 0)
 
+        use_block_causal_fastpath = (
+            case == "bsa-causal"
+            and args.bsa_causal_bwd_backend == "flex"
+        )
+        # The exact fast path derives the natural tail block from S.  Keep the
+        # block_sizes tensor for forward/FLOP accounting and omit it only from
+        # this backward call so arbitrary ragged metadata cannot be ignored.
+        backward_metadata = (
+            {name: value for name, value in metadata.items() if name != "block_sizes"}
+            if use_block_causal_fastpath
+            else metadata
+        )
+
         def backward():
             return BSA.block_sparse_attention_backward(
-                do, q, k, v, out, lse, **metadata,
+                do, q, k, v, out, lse, **backward_metadata,
                 sparse_block_size=64, layout="bshd",
+                block_causal=use_block_causal_fastpath,
             )
+
+        if (
+            case == "bsa-causal"
+            and args.bsa_causal_bwd_backend == "flex"
+            and args.verify_fastpath
+        ):
+            fast = backward()
+            baseline = BSA.block_sparse_attention_backward(
+                do,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                **metadata,
+                sparse_block_size=64,
+                layout="bshd",
+                block_causal=False,
+            )
+            torch.cuda.synchronize()
+            for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+                fast_grad = fast[name]
+                baseline_grad = baseline[name]
+                max_abs = (fast_grad.float() - baseline_grad.float()).abs().max().item()
+                torch.testing.assert_close(
+                    fast_grad.float(),
+                    baseline_grad.float(),
+                    atol=5e-2,
+                    rtol=5e-2,
+                )
+                print(f"fast-path check {name}: max_abs={max_abs:.6g}", flush=True)
+            del fast, baseline
 
     fwd_ms = measure(forward, f"BSA_ut__{case}__fwd", args.warmup, args.runs, flush)
     bwd_ms = measure(backward, f"BSA_ut__{case}__bwd", args.warmup, args.runs, flush)
@@ -124,6 +170,20 @@ def main():
     parser.add_argument("--seqlen", type=int, default=255424, help="Causal cases only; production uses production.json")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument(
+        "--bsa-causal-bwd-backend",
+        choices=("blk64", "flex"),
+        default="flex",
+        help=(
+            "Backward implementation for bsa-causal: the general 64x64 BSA "
+            "kernel or the exact block-causal Flex/FA4 fast path"
+        ),
+    )
+    parser.add_argument(
+        "--verify-fastpath",
+        action="store_true",
+        help="Compare the Flex block-causal backward with the blk64 baseline before timing",
+    )
     peak = parser.add_mutually_exclusive_group()
     peak.add_argument("--peak-tflops", type=float, help="Explicit per-GPU dense BF16 peak TFLOP/s")
     peak.add_argument("--clock-mhz", type=float, help="GB200/SM100 locked clock; derive peak from runtime SM count (does not lock clocks)")
@@ -146,6 +206,8 @@ def main():
     package = "flash-attn-cute" if args.case == "causal" else "nvidia-cudnn-frontend"
     print(f"{package}: {version(package)}; CUTLASS DSL: {version('nvidia-cutlass-dsl')}")
     print(f"BF16 BSHD, B={BATCH_SIZE} H={NUM_HEADS} D={HEAD_DIM}; median milliseconds; L2 flushed per sample")
+    if args.case == "bsa-causal":
+        print(f"BSA causal backward backend: {args.bsa_causal_bwd_backend}")
     if args.peak_tflops is not None:
         print(f"Single-GPU dense BF16 peak: {args.peak_tflops:.3f} TFLOP/s")
     print("Bwd TFLOP/s and MFU include QK recompute (10*D*pairs); fwd uses 4*D*pairs")

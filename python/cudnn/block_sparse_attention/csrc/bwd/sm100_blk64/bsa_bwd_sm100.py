@@ -98,8 +98,18 @@ class BlockSparseAttnBackwardSm100Blk64:
         self.tmem_dK_offset = 0
         self.tmem_dV_offset = self.tmem_dK_offset + self.QdS_mma_tiler[1]  # 64
         self.tmem_dQ_offset = self.tmem_dV_offset + self.dOP_mma_tiler[1]  # 64 + 64 = 128
-        self.tmem_dP_offset = self.tmem_dQ_offset  # 128
-        self.tmem_S_offset = self.tmem_dP_offset + self.dSK_mma_tiler[1]  # 128 + 128 = 256
+        self.tmem_dQ_stage_count = 2
+        self.tmem_dQ_stage_stride = self.dSK_mma_tiler[1]  # 128 columns per dQ stage
+        self.tmem_S_offset = (
+            self.tmem_dQ_offset + self.tmem_dQ_stage_count * self.tmem_dQ_stage_stride
+        )  # 128 + 2 * 128 = 384
+        # Keep dP independent from dQ.  When they alias, the MMA warp must wait
+        # for the reduction warps to finish moving every dQ tile out of TMEM
+        # before it can issue the next dP MMA.  The kernel allocates all 512
+        # SM100 TMEM columns.  Double-buffer dQ in [128, 384), then use
+        # [384, 448) for S and [448, 512) for dP.
+        self.tmem_dP_offset = self.tmem_S_offset + self.QK_mma_tiler[1]  # 384 + 64 = 448
+        assert self.tmem_dP_offset + self.dOV_mma_tiler[1] <= self.tmem_alloc_cols
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -116,7 +126,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         self.load_compute_sum_OdO_stage = 1
         self.mma_compute_S_stage = 1
         self.mma_compute_dP_stage = 1
-        self.mma_reduce_dQ_stage = 1
+        self.mma_reduce_dQ_stage = self.tmem_dQ_stage_count
         self.compute_mma_P_stage = 1
         self.compute_mma_dS_stage = 1
         self.mma_compute_dKdV_stage = 2
@@ -838,7 +848,14 @@ class BlockSparseAttnBackwardSm100Blk64:
 
                 tdQtdQ_shape = dSK_tiled_mma.partition_shape_C(cute.select(self.dSK_mma_tiler, mode=[0, 1]))
                 tdQtdQ = dSK_tiled_mma.make_fragment_C(tdQtdQ_shape)
-                tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ.layout)
+                tdQtdQ_layout_staged = cute.append(
+                    tdQtdQ.layout,
+                    cute.make_layout(
+                        self.mma_reduce_dQ_stage,
+                        stride=self.tmem_dQ_stage_stride,
+                    ),
+                )
+                tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ_layout_staged)
 
                 tdKTtdKT_shape = QdS_tiled_mma.partition_shape_C(cute.select(self.QdS_mma_tiler, mode=[0, 1]))
                 tdKTtdKT = QdS_tiled_mma.make_fragment_C(tdKTtdKT_shape)
@@ -946,7 +963,14 @@ class BlockSparseAttnBackwardSm100Blk64:
 
                 tdQtdQ_shape = dSK_tiled_mma.partition_shape_C(cute.select(self.dSK_mma_tiler, mode=[0, 1]))
                 tdQtdQ = dSK_tiled_mma.make_fragment_C(tdQtdQ_shape)
-                tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ.layout)
+                tdQtdQ_layout_staged = cute.append(
+                    tdQtdQ.layout,
+                    cute.make_layout(
+                        self.mma_reduce_dQ_stage,
+                        stride=self.tmem_dQ_stage_stride,
+                    ),
+                )
+                tdQtdQ = cute.make_tensor(tmem_ptr_base + self.tmem_dQ_offset, tdQtdQ_layout_staged)
 
                 self.reduce(
                     problem_shape,
@@ -1552,7 +1576,6 @@ class BlockSparseAttnBackwardSm100Blk64:
         load_mma_dO_pipeline.consumer_wait(load_mma_dO_consumer_state)
 
         mma_compute_dP_pipeline.producer_acquire(mma_compute_dP_producer_state)
-        mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
 
         # dP = dO * V
         dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1608,11 +1631,13 @@ class BlockSparseAttnBackwardSm100Blk64:
             compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state)
 
             mma_compute_dP_pipeline.producer_acquire(mma_compute_dP_producer_state)
+            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
 
             # dQ = dS * K
+            tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
             dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
-                cute.gemm(dSK_tiled_mma, tdQtdQ, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ)
+                cute.gemm(dSK_tiled_mma, tdQtdQ_cur, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ_cur)
                 dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
@@ -1635,7 +1660,6 @@ class BlockSparseAttnBackwardSm100Blk64:
             compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
             compute_mma_dS_consumer_state.advance()
 
-            mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
             load_mma_dO_pipeline.consumer_wait(load_mma_dO_consumer_state)
 
             # dP = dO * V
@@ -1697,9 +1721,14 @@ class BlockSparseAttnBackwardSm100Blk64:
         mma_compute_dKdV_producer_state.advance()
 
         # dQ = dS * K
+        # dP has a dedicated TMEM range, so the reduction warps can drain the
+        # preceding dQ while the MMA warp issues S/dP/dV.  Wait only when the
+        # next dQ tile is about to reuse the stage selected by the producer state.
+        mma_reduce_dQ_pipeline.producer_acquire(mma_reduce_dQ_producer_state)
+        tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_producer_state.index]
         dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         for k_block in cutlass.range(0, cute.size(tdQrdS, mode=[2]), unroll_full=True):
-            cute.gemm(dSK_tiled_mma, tdQtdQ, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ)
+            cute.gemm(dSK_tiled_mma, tdQtdQ_cur, tdQrdS[None, None, k_block, compute_mma_dS_consumer_state.index], tdQrKT[None, None, k_block, 0], tdQtdQ_cur)
             dSK_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
         mma_reduce_dQ_pipeline.producer_commit(mma_reduce_dQ_producer_state)
@@ -1964,14 +1993,16 @@ class BlockSparseAttnBackwardSm100Blk64:
         cdQ = cute.make_identity_tensor((self.dSK_mma_tiler[0], self.dSK_mma_tiler[1]))
         thread_idx = tidx % (self.num_reduce_warps * self.threads_per_warp)
 
-        tdQtdQ = tdQtdQ[(None, None), 0, 0]
+        # Build the copy mapping from one stage.  The producer and consumer
+        # pipeline states select matching TMEM stages at runtime below.
+        tdQtdQ_stage0 = tdQtdQ[None, None, None, 0]
+        tdQtdQ_stage0 = tdQtdQ_stage0[(None, None), 0, 0]
 
-        tiled_t2r = tcgen05.make_tmem_copy(load_op, tdQtdQ)
+        tiled_t2r = tcgen05.make_tmem_copy(load_op, tdQtdQ_stage0)
         thr_t2r = tiled_t2r.get_slice(thread_idx)
 
         tTR_cdQ = thr_t2r.partition_D(cdQ)
         tTR_sdQ = thr_t2r.partition_D(sdQ)
-        tTR_tdQ = thr_t2r.partition_S(tdQtdQ)
 
         sdQ = cute.make_tensor(sdQ.iterator, cute.make_layout(((8, 8), 2, (32, 1), (1, 2)), stride=(((32, 256), 2048, (1, 0), (0, 4096)))))
 
@@ -1990,6 +2021,9 @@ class BlockSparseAttnBackwardSm100Blk64:
             tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
 
             # Load dQ from tmem to rmem
+            tdQtdQ_cur = tdQtdQ[None, None, None, mma_reduce_dQ_consumer_state.index]
+            tdQtdQ_cur = tdQtdQ_cur[(None, None), 0, 0]
+            tTR_tdQ = thr_t2r.partition_S(tdQtdQ_cur)
             cute.copy(tiled_t2r, tTR_tdQ, tTR_rdQ)
 
             cute.arch.fence_view_async_tmem_load()

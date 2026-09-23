@@ -5,7 +5,7 @@
 | 用例 | 实现 | Mask |
 | --- | --- | --- |
 | `causal` | FlashAttention `magi_backend` | 标准 token causal：`k <= q` |
-| `bsa-causal` | cuDNN BSA | 64-token block causal，对角块内全可见 |
+| `bsa-causal` | cuDNN BSA forward；可选通用 blk64 或专用 Flex backward | 64-token block causal，对角块内全可见 |
 | `production` | cuDNN BSA | 四样本 text/video/audio packed mask，视频块 Top-K |
 
 两个 causal 用例的 mask 不完全相同，耗时比不是严格同一算子的加速比。
@@ -75,6 +75,27 @@ BSA_PYTHON=/path/to/bsa/bin/python CAUSAL_PYTHON=/path/to/causal/bin/python \
 .venv/causal/bin/python benchmark.py --case causal
 ```
 
+`bsa-causal` backward 默认使用精确的 block-causal 专用路径。它把
+`floor(k / 64) <= floor(q / 64)` 转换为缓存的 packed-mask plan，并使用
+SM100/SM103 的每 CTA 128×128、协作式 2-CTA backward kernel。通用 blk64 路径仍可用于
+A/B 对照：
+
+```bash
+# 先在小 shape 上同时运行两条路径并核对 dQ/dK/dV
+.venv/bsa/bin/python -u benchmark.py --case bsa-causal --seqlen 4096 \
+  --warmup 2 --runs 10 --bsa-causal-bwd-backend flex --verify-fastpath
+
+# PDF shape 的基线与优化后结果（direct 命令假设 GPU 已提前锁频）
+.venv/bsa/bin/python -u benchmark.py --case bsa-causal --seqlen 255424 \
+  --warmup 5 --runs 10 --clock-mhz 2032 --bsa-causal-bwd-backend blk64
+.venv/bsa/bin/python -u benchmark.py --case bsa-causal --seqlen 255424 \
+  --warmup 5 --runs 10 --clock-mhz 2032 --bsa-causal-bwd-backend flex
+```
+
+首次调用会构建 mask plan 并 JIT 编译 kernel；预热会把这些一次性成本排除在
+采样之外。锁频的一键测试可用
+`BSA_CAUSAL_BWD_BACKEND=blk64|flex GPU=0 bash run_all.sh 2032`。
+
 ## 输出与计时口径
 
 | 输出列 | 含义 |
@@ -121,4 +142,5 @@ NVTX 名称为 `BSA_ut__<case>__fwd` / `BSA_ut__<case>__bwd`，过滤表达式�
 结果为 `production_bwd.ncu-rep`；性能基线使用普通运行的耗时，不使用 NCU 采集期间的耗时。
 
 三组用例已在 GB200（L20A）、Torch 2.10 / CUDA 13.1 环境完成前后向性能运行。
-本工具不包含输出与梯度的数值正确性测试。
+`--verify-fastpath` 可对 block-causal 两条 backward 路径做梯度交叉检查；其他
+用例仍只测试性能。

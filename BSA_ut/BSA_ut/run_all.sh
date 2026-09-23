@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ $# != 1 || "$1" == --help ]]; then
     echo 'Usage: bash run_all.sh CLOCK_MHZ'
     echo 'Example: GPU=0 bash run_all.sh 2032'
-    echo 'Optional: WARMUP=5 RUNS=10 BSA_PYTHON=... CAUSAL_PYTHON=... LOG_DIR=...'
+    echo 'Optional: WARMUP=5 RUNS=10 BSA_CAUSAL_BWD_BACKEND=flex|blk64 BSA_PYTHON=... CAUSAL_PYTHON=... LOG_DIR=...'
     [[ "${1:-}" == --help ]] && exit 0
     exit 2
 fi
@@ -16,6 +16,7 @@ CLOCK_MHZ="$1"
 GPU="${GPU:-0}"
 WARMUP="${WARMUP:-5}"
 RUNS="${RUNS:-10}"
+BSA_CAUSAL_BWD_BACKEND="${BSA_CAUSAL_BWD_BACKEND:-flex}"
 BSA_PYTHON="${BSA_PYTHON:-$SCRIPT_DIR/.venv/bsa/bin/python}"
 CAUSAL_PYTHON="${CAUSAL_PYTHON:-$SCRIPT_DIR/.venv/causal/bin/python}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/results/locked_$(date +%Y%m%d_%H%M%S)_$$}"
@@ -47,7 +48,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 export CUDA_VISIBLE_DEVICES="$GPU"
-echo "GPU=$GPU CLOCK_MHZ=$CLOCK_MHZ WARMUP=$WARMUP RUNS=$RUNS" | tee "$LOG_DIR/config.log"
+if [[ "$BSA_CAUSAL_BWD_BACKEND" != "blk64" && "$BSA_CAUSAL_BWD_BACKEND" != "flex" ]]; then
+    echo "BSA_CAUSAL_BWD_BACKEND must be blk64 or flex" >&2
+    exit 2
+fi
+echo "GPU=$GPU CLOCK_MHZ=$CLOCK_MHZ WARMUP=$WARMUP RUNS=$RUNS BSA_CAUSAL_BWD_BACKEND=$BSA_CAUSAL_BWD_BACKEND" | tee "$LOG_DIR/config.log"
 echo "BSA_PYTHON=$BSA_PYTHON CAUSAL_PYTHON=$CAUSAL_PYTHON" | tee -a "$LOG_DIR/config.log"
 nvidia-smi -i "$GPU" -q > "$LOG_DIR/gpu_before.log"
 # A lock failure stops the run before any benchmark is launched.
@@ -70,9 +75,12 @@ for case in causal bsa-causal production; do
     else
         case_python="$BSA_PYTHON"
     fi
+    case_args=()
+    if [[ "$case" == bsa-causal ]]; then
+        case_args+=(--bsa-causal-bwd-backend "$BSA_CAUSAL_BWD_BACKEND")
+    fi
     echo "Running $case"
-    "$case_python" -u benchmark.py --case "$case" --clock-mhz "$CLOCK_MHZ" \
-        --warmup "$WARMUP" --runs "$RUNS" 2>&1 | tee "$LOG_DIR/$case.log"
+    "$case_python" -u benchmark.py --case "$case" --clock-mhz "$CLOCK_MHZ" --warmup "$WARMUP" --runs "$RUNS" "${case_args[@]}" 2>&1 | tee "$LOG_DIR/$case.log"
 done
 if ! kill -0 "$monitor_pid" 2>/dev/null; then
     cat "$LOG_DIR/monitor.log" >&2
