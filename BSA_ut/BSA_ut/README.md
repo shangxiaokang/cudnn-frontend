@@ -181,12 +181,19 @@ for bucket in 512 1024 2048 3991; do
 done
 ```
 
+For the bundled production fixture, leaving `--bucket-size-blocks` unset uses
+the experimental single-group value 3991: its compact row capacity is 1455, below
+half of the 3991-block Q domain. This enables the unique-writer dK/dV store
+specialization. Keep the explicit sweep above as the acceptance test: a real
+production mask with a different degree tail may still prefer 1024 or 2048.
+
 `masks.py` compacts the inactive q2k suffix after Top-K construction. This
 does not change the mask; it reduces CSR planning storage and scan work.
 The first split invocation JIT-compiles both CuTe and Triton kernels, so keep
 warmup enabled. The reported backward TFLOP/s remains the standard effective
-five-matmul (10D per visible pair) convention even though split recomputes
-QK/dP/dS in its separate dQ kernel.
+five-matmul (10D per visible pair) convention. Split physically executes about
+14D per pair: 8D in the dKV kernel plus 6D in the Q-major dQ kernel. Therefore
+its reported MFU is a baseline-comparison metric, not physical Tensor Core MFU.
 
 ## Profiling
 

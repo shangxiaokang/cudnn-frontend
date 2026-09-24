@@ -39,12 +39,17 @@ class BlockSparseAttnBackwardSm100Blk64:
         sparse_block_size: int,
         has_block_sizes: bool = True,
         compute_dq: bool = True,
+        atomic_dkv: bool = True,
     ):
         self.sparse_block_size = sparse_block_size
         self.has_block_sizes = has_block_sizes
         # False is used by the split production backend: this kernel computes
         # dK/dV while a Q-major kernel writes the final dQ.
         self.compute_dq = compute_dq
+        # Multiple Q groups produce partial dK/dV tiles that must be reduced
+        # globally.  With one group, each (B,H,K64) tile has a unique CTA and
+        # an ordinary predicated store is sufficient.
+        self.atomic_dkv = atomic_dkv
 
         self.QK_mma_tiler = (128, 64, 128)
         self.fake_QK_mma_tiler = (64, 64, 128)
@@ -59,7 +64,10 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         # =================== Sum OdO ================================
         self.sum_OdO_max_threads_per_block = 128
-        self.sum_OdO_block_q = 16
+        # The split production path has tens of thousands of independent
+        # sequence tiles.  Let each small preprocessing CTA cover four rows to
+        # reduce scheduler overhead without reducing useful parallelism.
+        self.sum_OdO_block_q = 64 if not self.compute_dq else 16
         self.sum_OdO_num_threads_d = 8
         self.sum_OdO_num_threads_q = self.sum_OdO_max_threads_per_block // self.sum_OdO_num_threads_d
         self.sum_OdO_elem_per_load = 2
@@ -191,7 +199,13 @@ class BlockSparseAttnBackwardSm100Blk64:
         sum_OdO_iter = workspace.iterator
         scaled_lse_iter = sum_OdO_iter + sum_OdO_elems
         dQ_acc_iter = scaled_lse_iter + scaled_lse_elems
-        dK_acc_iter = dQ_acc_iter + cute.assume(B_i64 * H_i64 * Q_i64 * D_i64, divby=4)
+        if cutlass.const_expr(self.compute_dq):
+            dK_acc_iter = dQ_acc_iter + cute.assume(B_i64 * H_i64 * Q_i64 * D_i64, divby=4)
+        else:
+            # The Q-major split kernel writes dQ directly.  Alias its unused
+            # descriptor at the dK base instead of reserving a ~500 MiB FP32
+            # dQ accumulator for the production shape.
+            dK_acc_iter = dQ_acc_iter
         dV_acc_iter = dK_acc_iter + cute.assume(B_i64 * H_i64 * K_i64 * D_i64, divby=4)
 
         sum_OdO_iter = cute.recast_ptr(sum_OdO_iter, dtype=self.acc_dtype)
@@ -621,7 +635,9 @@ class BlockSparseAttnBackwardSm100Blk64:
             min_blocks_per_mp=1,
         )
 
-        self.block_seq = 8
+        # As above, amortize the fixed cost of the lightweight dK/dV convert
+        # kernel in the split specialization.
+        self.block_seq = 32 if not self.compute_dq else 8
         self.num_threads_D_convert = 16
         self.num_threads_seq = 128 // self.num_threads_D_convert
         self.convert_elem_per_load = 4
@@ -2204,7 +2220,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         # Load tdVtdVT
         cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
 
-        self.store_add_fp32(tTR_gdV, tTR_rdV, tTR_cdV, (D, K))
+        self.store_dkv_fp32(tTR_gdV, tTR_rdV, tTR_cdV, (D, K))
 
         cute.arch.fence_view_async_tmem_load()
 
@@ -2215,20 +2231,21 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
 
-        self.store_add_fp32(tTR_gdK, tTR_rdK, tTR_cdK, (D, K))
+        self.store_dkv_fp32(tTR_gdK, tTR_rdK, tTR_cdK, (D, K))
 
         cute.arch.fence_view_async_tmem_load()
         mma_compute_dKdV_pipeline.consumer_release(mma_compute_dKdV_consumer_state)
         mma_compute_dKdV_consumer_state.advance()
 
     @cute.jit
-    def store_add_fp32(
+    def store_dkv_fp32(
         self,
         gmem: cute.Tensor,
         regs: cute.Tensor,
         coord: cute.Tensor,
         tensor_shape: cute.Shape,
     ):
+        # Store a complete tile, or atomically add a multi-group partial.
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.acc_dtype,
@@ -2260,12 +2277,15 @@ class BlockSparseAttnBackwardSm100Blk64:
                         coord = ((0, v), m, n, k)
                         if preds[v, m, n, k]:
                             ptr = tCg.iterator + cute.crd2idx(coord, tCg.layout)
-                            cute.arch.atomic_add(
-                                ptr.llvm_ptr,
-                                tCr[coord],
-                                sem="relaxed",
-                                scope="gpu",
-                            )
+                            if cutlass.const_expr(self.atomic_dkv):
+                                cute.arch.atomic_add(
+                                    ptr.llvm_ptr,
+                                    tCr[coord],
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                            else:
+                                ptr.store(tCr[coord])
 
     @cute.jit
     def split_wg(

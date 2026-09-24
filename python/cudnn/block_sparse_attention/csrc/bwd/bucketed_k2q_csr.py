@@ -19,14 +19,23 @@ class BucketedK2QCsrUniversal:
         block_sparse_num: int,
         bucket_size_blocks: int,
         has_variable_block_nums: bool,
-        max_kv_blocks: int,
     ):
         self.block_sparse_num = block_sparse_num
         self.bucket_size_blocks = bucket_size_blocks
         self.has_variable_block_nums = has_variable_block_nums
         self.num_edge_threads = 256
-        self.edge_width = max_kv_blocks if has_variable_block_nums else block_sparse_num
-        self.num_edge_tiles = (self.edge_width + self.num_edge_threads - 1) // self.num_edge_threads
+        # Fixed-count rows contain no inactive capacity to skip, so preserve
+        # their parallel edge-tiled grid. Variable-count rows use one CTA and
+        # stride to the runtime count instead of the physical row capacity.
+        self.num_edge_tiles = (
+            1
+            if has_variable_block_nums
+            else max(
+                1,
+                (block_sparse_num + self.num_edge_threads - 1)
+                // self.num_edge_threads,
+            )
+        )
 
     @cute.jit
     def __call__(
@@ -60,21 +69,25 @@ class BucketedK2QCsrUniversal:
 
         batch_size, num_heads, num_q_blocks, _ = mQ2kBlockIndex.shape
         num_q_groups = mCounts.shape[2]
+        # One CTA owns each variable-count Q row and strides only to that row's
+        # active count. Fixed-count rows retain their capacity-tiled grid.
+        # The old capacity-tiled grid launched six CTAs per production row
+        # because a few dense text rows set a 1455-wide physical capacity,
+        # even though 96% of rows contain at most 192 edges.
         edge_grid = (
             num_q_blocks * self.num_edge_tiles,
             num_heads,
             batch_size,
         )
-        if const_expr(self.edge_width > 0):
-            self._count_edges_kernel(
-                mCounts,
-                mQ2kBlockIndex,
-                mQ2kBlockNums,
-            ).launch(
-                grid=edge_grid,
-                block=(self.num_edge_threads, 1, 1),
-                stream=stream,
-            )
+        self._count_edges_kernel(
+            mCounts,
+            mQ2kBlockIndex,
+            mQ2kBlockNums,
+        ).launch(
+            grid=edge_grid,
+            block=(self.num_edge_threads, 1, 1),
+            stream=stream,
+        )
 
         group_grid = (num_q_groups, num_heads, batch_size)
         self._local_offsets_kernel(
@@ -97,17 +110,16 @@ class BucketedK2QCsrUniversal:
             stream=stream,
         )
 
-        if const_expr(self.edge_width > 0):
-            self._scatter_q_indices_kernel(
-                mCursors,
-                mBucketedK2qIndices,
-                mQ2kBlockIndex,
-                mQ2kBlockNums,
-            ).launch(
-                grid=edge_grid,
-                block=(self.num_edge_threads, 1, 1),
-                stream=stream,
-            )
+        self._scatter_q_indices_kernel(
+            mCursors,
+            mBucketedK2qIndices,
+            mQ2kBlockIndex,
+            mQ2kBlockNums,
+        ).launch(
+            grid=edge_grid,
+            block=(self.num_edge_threads, 1, 1),
+            stream=stream,
+        )
 
     @cute.kernel
     def _count_edges_kernel(
@@ -120,32 +132,37 @@ class BucketedK2QCsrUniversal:
         q_edge_tile_idx, head_idx, batch_idx = cute.arch.block_idx()
         q_block_idx = q_edge_tile_idx // self.num_edge_tiles
         edge_tile_idx = q_edge_tile_idx - q_block_idx * self.num_edge_tiles
-        block_idx = edge_tile_idx * self.num_edge_threads + tidx
         num_kv_blocks = mCounts.shape[3]
-        if block_idx < self.edge_width:
-            num_active_blocks = Int32(self.block_sparse_num)
-            if const_expr(self.has_variable_block_nums):
-                num_active_blocks = mQ2kBlockNums[batch_idx, head_idx, q_block_idx]
-            if block_idx < num_active_blocks:
-                kv_block_idx = mQ2kBlockIndex[batch_idx, head_idx, q_block_idx, block_idx]
-                if kv_block_idx >= 0:
-                    if kv_block_idx < num_kv_blocks:
-                        q_group_idx = q_block_idx // self.bucket_size_blocks
-                        count_ptr = mCounts.iterator + cute.crd2idx(
-                            (
-                                batch_idx,
-                                head_idx,
-                                q_group_idx,
-                                kv_block_idx,
-                            ),
-                            mCounts.layout,
-                        )
-                        cute.arch.atomic_add(
-                            count_ptr.llvm_ptr,
-                            Int32(1),
-                            sem="relaxed",
-                            scope="gpu",
-                        )
+        max_active_blocks = Int32(mQ2kBlockIndex.shape[3])
+        num_active_blocks = Int32(self.block_sparse_num)
+        if const_expr(self.has_variable_block_nums):
+            num_active_blocks = mQ2kBlockNums[batch_idx, head_idx, q_block_idx]
+        if num_active_blocks > max_active_blocks:
+            num_active_blocks = max_active_blocks
+
+        block_idx = edge_tile_idx * self.num_edge_threads + tidx
+        block_step = self.num_edge_threads * self.num_edge_tiles
+        while block_idx < num_active_blocks:
+            kv_block_idx = mQ2kBlockIndex[batch_idx, head_idx, q_block_idx, block_idx]
+            if kv_block_idx >= 0:
+                if kv_block_idx < num_kv_blocks:
+                    q_group_idx = q_block_idx // self.bucket_size_blocks
+                    count_ptr = mCounts.iterator + cute.crd2idx(
+                        (
+                            batch_idx,
+                            head_idx,
+                            q_group_idx,
+                            kv_block_idx,
+                        ),
+                        mCounts.layout,
+                    )
+                    cute.arch.atomic_add(
+                        count_ptr.llvm_ptr,
+                        Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+            block_idx += block_step
 
     @cute.kernel
     def _local_offsets_kernel(
@@ -196,33 +213,38 @@ class BucketedK2QCsrUniversal:
         q_edge_tile_idx, head_idx, batch_idx = cute.arch.block_idx()
         q_block_idx = q_edge_tile_idx // self.num_edge_tiles
         edge_tile_idx = q_edge_tile_idx - q_block_idx * self.num_edge_tiles
-        block_idx = edge_tile_idx * self.num_edge_threads + tidx
         num_kv_blocks = mCursors.shape[3]
-        if block_idx < self.edge_width:
-            num_active_blocks = Int32(self.block_sparse_num)
-            if const_expr(self.has_variable_block_nums):
-                num_active_blocks = mQ2kBlockNums[batch_idx, head_idx, q_block_idx]
-            if block_idx < num_active_blocks:
-                kv_block_idx = mQ2kBlockIndex[batch_idx, head_idx, q_block_idx, block_idx]
-                if kv_block_idx >= 0:
-                    if kv_block_idx < num_kv_blocks:
-                        q_group_idx = q_block_idx // self.bucket_size_blocks
-                        cursor_ptr = mCursors.iterator + cute.crd2idx(
-                            (
-                                batch_idx,
-                                head_idx,
-                                q_group_idx,
-                                kv_block_idx,
-                            ),
-                            mCursors.layout,
-                        )
-                        position = cute.arch.atomic_add(
-                            cursor_ptr.llvm_ptr,
-                            Int32(1),
-                            sem="relaxed",
-                            scope="gpu",
-                        )
-                        mBucketedK2qIndices[batch_idx, head_idx, position] = Int32(q_block_idx)
+        max_active_blocks = Int32(mQ2kBlockIndex.shape[3])
+        num_active_blocks = Int32(self.block_sparse_num)
+        if const_expr(self.has_variable_block_nums):
+            num_active_blocks = mQ2kBlockNums[batch_idx, head_idx, q_block_idx]
+        if num_active_blocks > max_active_blocks:
+            num_active_blocks = max_active_blocks
+
+        block_idx = edge_tile_idx * self.num_edge_threads + tidx
+        block_step = self.num_edge_threads * self.num_edge_tiles
+        while block_idx < num_active_blocks:
+            kv_block_idx = mQ2kBlockIndex[batch_idx, head_idx, q_block_idx, block_idx]
+            if kv_block_idx >= 0:
+                if kv_block_idx < num_kv_blocks:
+                    q_group_idx = q_block_idx // self.bucket_size_blocks
+                    cursor_ptr = mCursors.iterator + cute.crd2idx(
+                        (
+                            batch_idx,
+                            head_idx,
+                            q_group_idx,
+                            kv_block_idx,
+                        ),
+                        mCursors.layout,
+                    )
+                    position = cute.arch.atomic_add(
+                        cursor_ptr.llvm_ptr,
+                        Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    mBucketedK2qIndices[batch_idx, head_idx, position] = Int32(q_block_idx)
+            block_idx += block_step
 
 
 def _bucketed_k2q_csr_compile_key(
@@ -230,15 +252,16 @@ def _bucketed_k2q_csr_compile_key(
     block_sparse_num: int,
     bucket_size_blocks: int,
     has_variable_block_nums: bool,
-    max_kv_blocks: int,
 ) -> tuple:
     """Return only the configuration that changes generated device code."""
-    edge_width = max_kv_blocks if has_variable_block_nums else block_sparse_num
     return (
         device_capability,
         int(bucket_size_blocks),
         bool(has_variable_block_nums),
-        int(edge_width),
+        # Runtime counts determine the loop bound in the variable-count
+        # specialization, so changing a mask's physical capacity must not
+        # trigger another compilation.
+        0 if has_variable_block_nums else int(block_sparse_num),
     )
 
 
@@ -326,14 +349,12 @@ def build_bucketed_k2q_csr_cutedsl(
         block_sparse_num,
         bucket_size_blocks,
         has_variable_block_nums,
-        max_kv_blocks,
     )
     if compile_key not in build_bucketed_k2q_csr_cutedsl.compile_cache:
         kernel = BucketedK2QCsrUniversal(
-            int(block_sparse_num),
+            0 if has_variable_block_nums else int(block_sparse_num),
             int(bucket_size_blocks),
             has_variable_block_nums,
-            max_kv_blocks,
         )
         build_bucketed_k2q_csr_cutedsl.compile_cache[compile_key] = cute.compile(
             kernel,

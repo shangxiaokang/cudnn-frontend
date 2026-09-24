@@ -156,7 +156,11 @@ def test_bsa_attention_backward_sm100_blk64(num_q_blocks):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=17)
 @pytest.mark.parametrize("qmajor_block_n", [32, 64])
-def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
+@pytest.mark.parametrize("bucket_size_blocks", [None, 2])
+def test_bsa_attention_backward_sm100_blk64_split_irregular(
+    qmajor_block_n,
+    bucket_size_blocks,
+):
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
@@ -165,39 +169,52 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
 
     BSA = _import_bsa()
     block_size = 64
-    batch, heads, blocks, dim = 2, 2, 5, 128
-    seqlen = blocks * block_size
-    q, k, v = [
-        torch.randn((batch, seqlen, heads, dim), device="cuda", dtype=torch.bfloat16)
-        for _ in range(3)
+    batch, heads, q_blocks, kv_blocks, dim = 2, 2, 6, 7, 128
+    seqlen_q, seqlen_k = q_blocks * block_size, kv_blocks * block_size
+    q = torch.randn(
+        (batch, seqlen_q, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    k, v = [
+        torch.randn(
+            (batch, seqlen_k, heads, dim), device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(2)
     ]
     do = torch.randn_like(q)
 
     # Head-specific rows and a capacity larger than several active prefixes
     # exercise runtime counts, odd tails, and arbitrary (not causal) ordering.
-    q2k = torch.zeros((batch, heads, blocks, blocks), dtype=torch.int32, device="cuda")
+    q2k = torch.zeros(
+        (batch, heads, q_blocks, kv_blocks), dtype=torch.int32, device="cuda"
+    )
     counts = torch.tensor(
-        [[[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]]],
+        [[[1, 2, 3, 4, 5, 3], [5, 4, 3, 2, 1, 2]]],
         dtype=torch.int32,
         device="cuda",
     ).expand(batch, -1, -1).contiguous()
-    ids = torch.arange(blocks, dtype=torch.int32, device="cuda")
+    # Keep the final K block completely unreferenced.  This checks that both
+    # the unique-writer store and multi-group atomic paths preserve the zero
+    # gradient produced by the pre-zeroed dK/dV accumulator workspace.
+    ids = torch.arange(kv_blocks - 1, dtype=torch.int32, device="cuda")
+    counts_host = ([1, 2, 3, 4, 5, 3], [5, 4, 3, 2, 1, 2])
     for batch_idx in range(batch):
-        for row in range(blocks):
-            q2k[batch_idx, 0, row, : row + 1] = ids.roll(batch_idx).flip(0)[: row + 1]
-            q2k[batch_idx, 1, row, : blocks - row] = ids.roll(row + batch_idx)[: blocks - row]
+        for row in range(q_blocks):
+            count_h0 = counts_host[0][row]
+            count_h1 = counts_host[1][row]
+            q2k[batch_idx, 0, row, :count_h0] = ids.roll(batch_idx).flip(0)[:count_h0]
+            q2k[batch_idx, 1, row, :count_h1] = ids.roll(row + batch_idx)[:count_h1]
     block_sizes = torch.tensor(
-        [[64, 30, 48, 40, 13], [55, 64, 23, 48, 32]],
+        [[64, 30, 48, 40, 13, 51, 29], [55, 64, 23, 48, 32, 41, 19]],
         dtype=torch.int32,
         device="cuda",
     )
 
     mask = block_sparse_mask(
         q2k,
-        blocks,
+        kv_blocks,
         block_sizes,
-        seqlen,
-        seqlen,
+        seqlen_q,
+        seqlen_k,
         block_size,
         q2k_block_nums=counts,
     )
@@ -214,14 +231,18 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
         k,
         v,
         q2k,
-        blocks,
+        kv_blocks,
         block_sizes,
         q2k_block_nums=counts,
         sparse_block_size=block_size,
         layout="bshd",
         use_clc=False,
     )
-    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    dq, dk, dv = (
+        torch.full_like(q, float("nan")),
+        torch.full_like(k, float("nan")),
+        torch.full_like(v, float("nan")),
+    )
     backward = BSA.block_sparse_attention_backward(
         do,
         q,
@@ -230,7 +251,7 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
         forward["o_tensor"],
         forward["lse_tensor"],
         q2k,
-        blocks,
+        kv_blocks,
         block_sizes,
         q2k_block_nums=counts,
         dq_tensor=dq,
@@ -240,6 +261,7 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
         layout="bshd",
         backward_backend="split",
         qmajor_block_n=qmajor_block_n,
+        bucket_size_blocks=bucket_size_blocks,
     )
     assert backward["dq_tensor"].data_ptr() == dq.data_ptr()
     assert backward["dk_tensor"].data_ptr() == dk.data_ptr()
@@ -247,6 +269,105 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(qmajor_block_n):
     torch.testing.assert_close(dq.transpose(1, 2).float(), dq_ref, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dk.transpose(1, 2).float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(dv.transpose(1, 2).float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+def test_bucketed_k2q_csr_long_rows_and_dynamic_capacity():
+    if not torch.cuda.is_available():
+        pytest.skip("bucketed K2Q CSR test requires CUDA")
+    if torch.cuda.get_device_capability()[0] not in {9, 10, 11}:
+        pytest.skip("bucketed K2Q CSR CuTe kernel requires SM90-SM110")
+
+    try:
+        from cudnn.block_sparse_attention.csrc.bwd.bucketed_k2q_csr import (
+            build_bucketed_k2q_csr_cutedsl,
+        )
+    except (ImportError, OSError) as error:
+        pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
+
+    batch, heads, q_blocks, kv_blocks = 1, 2, 4, 320
+
+    def check_capacity(capacity, counts_values):
+        base = torch.arange(capacity, dtype=torch.int32, device="cuda")
+        q2k = torch.empty(
+            (batch, heads, q_blocks, capacity),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        for head in range(heads):
+            for row in range(q_blocks):
+                q2k[0, head, row] = base.roll(17 * row + 31 * head)
+        counts = torch.tensor(
+            [counts_values],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        offsets, indices, num_groups, _ = build_bucketed_k2q_csr_cutedsl(
+            q2k,
+            capacity,
+            kv_blocks,
+            bucket_size_blocks=2,
+            q2k_block_nums=counts,
+        )
+        torch.cuda.synchronize()
+        assert num_groups == 2
+
+        q2k_cpu = q2k.cpu()
+        counts_cpu = counts.cpu()
+        offsets_cpu = offsets.cpu()
+        indices_cpu = indices.cpu()
+        active_ids = {}
+        for head in range(heads):
+            for q_block in range(q_blocks):
+                count = int(counts_cpu[0, head, q_block])
+                active_ids[head, q_block] = set(
+                    q2k_cpu[0, head, q_block, :count].tolist()
+                )
+        for head in range(heads):
+            for group in range(num_groups):
+                q_begin, q_end = group * 2, min((group + 1) * 2, q_blocks)
+                for kv_block in range(kv_blocks):
+                    begin = int(offsets_cpu[0, head, group, kv_block])
+                    end = int(offsets_cpu[0, head, group, kv_block + 1])
+                    actual = sorted(indices_cpu[0, head, begin:end].tolist())
+                    expected = [
+                        q_block
+                        for q_block in range(q_begin, q_end)
+                        if kv_block in active_ids[head, q_block]
+                    ]
+                    assert actual == expected
+
+    # The second call must reuse the variable-count compile-cache entry even
+    # though the physical row capacity changes, and it must execute the
+    # stride-256 loop at least twice for several rows.
+    check_capacity(17, ((17, 13, 5, 0), (13, 17, 0, 5)))
+    check_capacity(300, ((300, 257, 17, 0), (257, 300, 0, 17)))
+
+    # Fixed-count rows have no inactive capacity to skip and retain the old
+    # capacity-tiled grid.  Exercise its second 256-edge CTA explicitly.
+    capacity = 300
+    base = torch.arange(capacity, dtype=torch.int32, device="cuda")
+    q2k_fixed = torch.stack((base, base.roll(37))).view(1, 1, 2, capacity)
+    offsets, indices, num_groups, _ = build_bucketed_k2q_csr_cutedsl(
+        q2k_fixed,
+        capacity,
+        kv_blocks,
+        bucket_size_blocks=1,
+    )
+    torch.cuda.synchronize()
+    assert num_groups == 2
+    offsets_cpu = offsets.cpu()
+    indices_cpu = indices.cpu()
+    q2k_fixed_cpu = q2k_fixed.cpu()
+    for group in range(num_groups):
+        active_ids = set(q2k_fixed_cpu[0, 0, group].tolist())
+        for kv_block in range(kv_blocks):
+            begin = int(offsets_cpu[0, 0, group, kv_block])
+            end = int(offsets_cpu[0, 0, group, kv_block + 1])
+            actual = indices_cpu[0, 0, begin:end].tolist()
+            expected = [group] if kv_block in active_ids else []
+            assert actual == expected
 
 
 @pytest.mark.L0

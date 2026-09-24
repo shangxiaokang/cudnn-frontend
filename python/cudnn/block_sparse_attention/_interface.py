@@ -572,12 +572,14 @@ def _empty_bwd_workspace_with_zeroed_accum(
     round_k_to: int,
     round_d_to: int,
     zero_dq_accum: bool,
+    include_dq_accum: bool = True,
     device: torch.device,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
-    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + 2 * k_rounded * d_rounded
+    dq_accum_elems = q_rounded * d_rounded if include_dq_accum else 0
+    elems_per_bh = 2 * q_rounded + dq_accum_elems + 2 * k_rounded * d_rounded
     workspace = torch.empty(
         (
             batch_size,
@@ -589,13 +591,14 @@ def _empty_bwd_workspace_with_zeroed_accum(
     )
     # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
     # buffer. They split the raw pointer field-major across all N = B * H entries:
-    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
+    #   [all N dPsum][all N LSE][optional all N dQ accum]
+    #   [all N dK accum][all N dV accum]
     # so the flat start of each field is N * (per-BH elements of the preceding
     # fields), and the accumulator tail must be zeroed on the flattened view.
     # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
     # would zero the wrong bytes for B * H > 1.
     accum_offset = 2 * q_rounded
-    if not zero_dq_accum:
+    if include_dq_accum and not zero_dq_accum:
         accum_offset += q_rounded * d_rounded
     flat_accum_offset = batch_size * num_heads * accum_offset
     workspace.reshape(-1)[flat_accum_offset:].zero_()
@@ -2087,7 +2090,9 @@ def bsa_attn_bwd(
         dq, dk, dv: Optional pre-allocated output buffers matching the shapes of
             q/k/v. When None, fresh zero-initialized tensors are allocated.
         bucket_size_blocks: Optional number of Q blocks per bucketed k2q CSR
-            group. ``None`` selects the architecture default.
+            group. ``None`` selects the architecture default. On the SM100
+            split blk64 path, a value at least as large as the number of Q
+            blocks selects the unique-writer, non-atomic dK/dV specialization.
         sparse_block_size: Explicit sparse block size. SM90 requires 64;
             SM100/SM110 accepts 64 or 128. When omitted, legacy direct callers
             retain shape-based inference on SM100/SM110.
@@ -2246,7 +2251,11 @@ def bsa_attn_bwd(
         return dq_out, dk_out, dv_out
 
     if bucket_size_blocks is None:
-        bucket_size_blocks = sm90_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks) if arch // 10 == 9 else sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks)
+        bucket_size_blocks = (
+            sm90_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks)
+            if arch // 10 == 9
+            else sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks)
+        )
 
     dq_out, dk_out, dv_out = _bsa_attn_bwd_bucketed_k2q_csr(
         dout_bwd,
@@ -2501,8 +2510,9 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_k_to=8,
         round_d_to=8,
         # The split backend writes dQ directly and never touches dQ_acc.
-        # Leave that field uninitialized and only zero the dK/dV accumulators.
+        # Omit that field entirely and only zero the dK/dV accumulators.
         zero_dq_accum=not split_dq,
+        include_dq_accum=not split_dq,
         device=q.device,
     )
 
@@ -2517,6 +2527,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         sparse_block_size,
         arch,
         has_block_sizes,
+        _num_q_groups > 1,
         _tensor_layout_compile_key(dout),
         _tensor_layout_compile_key(out),
         _tensor_layout_compile_key(q),
@@ -2554,6 +2565,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
             compute_dq=not split_dq,
+            atomic_dkv=_num_q_groups > 1,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(

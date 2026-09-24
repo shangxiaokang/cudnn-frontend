@@ -403,8 +403,10 @@ def block_sparse_attention_backward(
     SM100/SM103. The K-major CuTe kernel computes dK/dV without per-edge dQ
     reductions, and an exact Q-major Triton kernel accumulates and writes dQ
     once per Q64 block. ``qmajor_block_n`` selects its 32- or 64-token K
-    sub-tile. The split backend is explicit because its benefit depends on
-    sparse row geometry.
+    sub-tile. Setting ``bucket_size_blocks`` to at least the number of Q blocks
+    enables a unique-writer dK/dV specialization without global atomics. The
+    split backend is explicit because its benefit depends on sparse row and
+    column geometry.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)

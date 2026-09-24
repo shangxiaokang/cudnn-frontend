@@ -207,7 +207,10 @@ The result keys are `dq_tensor`, `dk_tensor`, and `dv_tensor`. Optional
 preallocated `dq_tensor`, `dk_tensor`, and `dv_tensor` arguments are supported.
 The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
-the backend default.
+the backend default. On SM100/SM103, setting the split backend's bucket size to
+at least the number of Q blocks creates one Q group. In that specialization
+each `(batch, head, K block)` has one writer, so dK/dV use ordinary FP32 stores
+instead of global atomics. Multi-group configurations retain the atomic path.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
@@ -236,7 +239,8 @@ supported. `qmajor_block_n` selects a 32- or 64-token K sub-tile; 32 is the
 default. This route requires BF16, head dimension 128, sparse block size 64,
 Triton, and SM100/SM103. It is opt-in because performance depends on sparse
 row length and because the fused kernel remains preferable for some small
-or regular masks.
+or regular masks. Its dKV-only CuTe specialization also omits the unused FP32
+dQ accumulator workspace.
 
 ## Current support
 

@@ -268,6 +268,17 @@ def main():
     if args.verify_production_backend and args.bsa_causal_bwd_backend == "blk64":
         parser.error("blk64 is already the production verification baseline")
     if (
+        args.case == "production"
+        and args.bsa_causal_bwd_backend == "split"
+        and args.bucket_size_blocks is None
+    ):
+        # The bundled mask has 3991 Q64 blocks and enough K-major parallelism
+        # for one group.  This explicitly enables the unique-writer dK/dV
+        # specialization without changing the generic library default for
+        # arbitrary sparse graphs with an unknown column-degree tail.
+        padded_tokens = int(load_fixture()["padded_tokens"])
+        args.bucket_size_blocks = (padded_tokens + 63) // 64
+    if (
         args.case == "bsa-causal"
         and args.bsa_causal_bwd_backend == "flex"
         and args.bucket_size_blocks is not None
@@ -306,7 +317,12 @@ def main():
         )
     if args.peak_tflops is not None:
         print(f"Single-GPU dense BF16 peak: {args.peak_tflops:.3f} TFLOP/s")
-    print("Bwd TFLOP/s and MFU include QK recompute (10*D*pairs); fwd uses 4*D*pairs")
+    print("Bwd TFLOP/s/MFU use the standard effective 10*D*pairs convention; fwd uses 4*D*pairs")
+    if args.case != "causal" and args.bsa_causal_bwd_backend == "split":
+        print(
+            "Split executes about 14*D*pairs (dKV=8D plus Q-major dQ=6D); "
+            "the reported 10D metric is for baseline comparison, not physical TC MFU"
+        )
     print(f"{'case':12s}  {'seqlen':>7s}  {'fwd_ms':>10s}  {'bwd_ms':>10s}  "
           f"{'fwd_TFLOP/s':>12s}  {'bwd_TFLOP/s':>12s}  {'fwd_MFU_%':>10s}  {'bwd_MFU_recomp_%':>17s}")
     l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
