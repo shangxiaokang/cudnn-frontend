@@ -1990,11 +1990,15 @@ class BlockSparseAttnBackwardSm100Blk64:
 
             mma_reduce_dQ_pipeline.consumer_wait(mma_reduce_dQ_consumer_state)
 
-            q_block_idx_0 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
-            iter_index += 1
+            # Only warp 0 issues the dQ TMA reductions below. Avoid issuing
+            # the same two CSR loads from all four reducer warps.
+            q_block_idx_0 = Int32(0)
             q_block_idx_1 = Q // self.sparse_block_size
-            if iter_index < total_iter_count:
-                q_block_idx_1 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
+            if warp_idx == 0:
+                q_block_idx_0 = bucketed_k2q_indices[k2q_begin + iter_index, (blk_coord_h, blk_coord_b)]
+                if iter_index + 1 < total_iter_count:
+                    q_block_idx_1 = bucketed_k2q_indices[k2q_begin + iter_index + 1, (blk_coord_h, blk_coord_b)]
+            iter_index += 1
 
             tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
 
