@@ -183,18 +183,26 @@ def block_sparse_attention_forward(
     layout: str = "bhsd",
     kv_splits: int | str = 1,
     use_clc: Optional[bool] = None,
+    block_causal: bool = False,
 ) -> TupleDict:
-    """Run non-causal block-sparse scaled dot-product attention.
+    """Run block-sparse scaled dot-product attention.
 
     The sparse pattern is supplied as a list of KV block ids for every query
     block.  This wrapper only dispatches to Python CuTe DSL kernels; the former
     SM100 C++/AOT extension is intentionally not part of this package.
+
+    With block_causal=True, the caller promises that Q64 block i attends to
+    complete K64 blocks 0..i in order.  The fast path derives these indices
+    and the natural final block size from the sequence length.  Pass
+    block_sizes=None, q2k_block_nums, and allow_empty_block_nums=False.
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
+    if type(block_causal) is not bool:
+        raise TypeError("block_causal must be a bool")
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
     if arch_family not in {9, 10, 11, 12}:
@@ -204,6 +212,19 @@ def block_sparse_attention_forward(
         sparse_block_size = 64 if arch_family in {9, 12} else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
+    if block_causal:
+        if sparse_block_size != 64 or arch_family not in {10, 11}:
+            raise NotImplementedError("block_causal forward requires SM100/SM110 and sparse_block_size=64")
+        if q_tensor.dtype != torch.bfloat16 or head_dim != 128 or value_dim != 128:
+            raise NotImplementedError("block_causal forward requires BF16 and QK=V=128")
+        if num_q_heads != num_kv_heads or seqlen_q != seqlen_k:
+            raise NotImplementedError("block_causal forward requires MHA and equal Q/K lengths")
+        if kv_splits != 1 or pack_gqa or use_clc is not None:
+            raise NotImplementedError("block_causal forward requires kv_splits=1, pack_gqa=False and use_clc=None")
+        if block_sizes is not None or allow_empty_block_nums:
+            raise ValueError("block_causal forward requires block_sizes=None and allow_empty_block_nums=False")
+        if q2k_block_nums is None:
+            raise ValueError("block_causal forward requires per-Q64 q2k_block_nums")
     if arch_family == 9:
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
@@ -266,7 +287,23 @@ def block_sparse_attention_forward(
     with torch.cuda.device(q_tensor.device):
         from . import _interface
 
-        if sparse_block_size == 64 and arch_family in {10, 11}:
+        if block_causal:
+            out, lse = _interface.bsa_attn_fwd(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                q2k_block_index,
+                block_sparse_num,
+                block_sizes,
+                q2k_block_nums=q2k_block_nums,
+                allow_empty_block_nums=allow_empty_block_nums,
+                softmax_scale=softmax_scale,
+                pack_gqa=False,
+                return_lse=True,
+                layout=layout,
+                block_causal=True,
+            )
+        elif sparse_block_size == 64 and arch_family in {10, 11}:
             out, lse = _interface.bsa_attn_fwd_blk64_cutedsl(
                 q_tensor,
                 k_tensor,

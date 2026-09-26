@@ -1733,6 +1733,7 @@ def bsa_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     layout: str = "bhsd",
     kv_splits: int | str = 1,
+    block_causal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for BSA block-sparse attention (SM90/SM100, non-causal, non-varlen).
 
@@ -1779,12 +1780,16 @@ def bsa_attn_fwd(
     assert head_dim_k == head_dim
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-
     assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "BSA only supports SM90/SM100/SM110/SM120"
     assert num_head % num_head_kv == 0
+    if block_causal:
+        assert q.dtype == torch.bfloat16 and head_dim == head_dim_v == 128
+        assert seqlen_q == seqlen_k and num_head == num_head_kv
+        assert arch // 10 in (10, 11)
+        assert kv_splits == 1 and not pack_gqa
 
     # Block-sparse parameter validation
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
@@ -1953,6 +1958,7 @@ def bsa_attn_fwd(
         pack_gqa=pack_gqa,
         allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
         has_block_sizes=has_block_sizes,
+        block_causal=block_causal,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -1972,6 +1978,7 @@ def bsa_attn_fwd(
             has_variable_block_nums,
             allow_empty_block_nums and has_variable_block_nums,
             has_block_sizes,
+            block_causal,
             "bhsd_kernel_boundary",
         ),
         (

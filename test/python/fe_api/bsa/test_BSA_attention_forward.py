@@ -253,6 +253,52 @@ def test_bsa_attention_forward_sm100_blk64():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+@pytest.mark.parametrize("seqlen,layout", [(192, "bhsd"), (255, "bshd"), (320, "bhsd")])
+def test_bsa_attention_forward_sm100_blk64_block_causal(seqlen, layout):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in {10, 11}:
+        pytest.skip("block-causal forward requires SM100/SM110")
+
+    BSA = _import_bsa()
+    batch, heads, dim = 1, 2, 128
+    q, k, v = (
+        torch.randn((batch, heads, seqlen, dim), device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    if layout == "bshd":
+        q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
+
+    num_blocks = (seqlen + 63) // 64
+    q2k = torch.zeros((batch, heads, num_blocks, num_blocks), device="cuda", dtype=torch.int32)
+    for q_block in range(num_blocks):
+        q2k[..., q_block, : q_block + 1] = torch.arange(q_block + 1, device="cuda", dtype=torch.int32)
+    block_nums = torch.arange(1, num_blocks + 1, device="cuda", dtype=torch.int32)
+    block_nums = block_nums.view(1, 1, num_blocks).expand(batch, heads, num_blocks).contiguous()
+
+    args = (q, k, v, q2k, 0, None)
+    kwargs = dict(q2k_block_nums=block_nums, sparse_block_size=64, layout=layout)
+    block_sizes = torch.tensor(
+        [min(64, seqlen - 64 * block) for block in range(num_blocks)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    baseline = BSA.block_sparse_attention_forward(q, k, v, q2k, 0, block_sizes, **kwargs)
+    causal = BSA.block_sparse_attention_forward(*args, **kwargs, block_causal=True)
+
+    torch.testing.assert_close(causal["o_tensor"], baseline["o_tensor"], atol=1e-2, rtol=1e-2)
+    # The generic path's implicit physical KV tail has an LSE error at
+    # seqlen=255. Compare the specialization with the block-causal FP32
+    # reference so this test checks the intended math independently.
+    q_bhsd = q if layout == "bhsd" else q.transpose(1, 2)
+    k_bhsd = k if layout == "bhsd" else k.transpose(1, 2)
+    scores = torch.matmul(q_bhsd.float(), k_bhsd.float().transpose(-1, -2)) * (dim ** -0.5)
+    token_blocks = torch.arange(seqlen, device=q.device) // 64
+    scores.masked_fill_(token_blocks[:, None] < token_blocks[None, :], -torch.inf)
+    lse_ref = torch.logsumexp(scores, dim=-1)
+    torch.testing.assert_close(causal["lse_tensor"], lse_ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(("seqlen_k", "expected"), [(4 * 64, False), (4 * 64 - 1, True)])
 def test_bsa_attention_forward_sm100_blk64_detects_partial_kv_tail(seqlen_k, expected):
     _import_bsa()

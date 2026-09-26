@@ -239,7 +239,10 @@ def pytest_configure(config):
     print(f"PyTorch GPU Name: {torch.cuda.get_device_name()}")
     print(f"PyTorch SM Arch Version: {torch.cuda.get_device_capability()}")
     print(f"PyTorch CUDA Version: {torch.version.cuda}")
-    print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    try:
+        print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    except RuntimeError as e:
+        print(f"PyTorch cuDNN Version unavailable: {e}")
 
 # fmt: off
 def pytest_addoption(parser):

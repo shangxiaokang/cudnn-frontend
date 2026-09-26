@@ -73,6 +73,7 @@ class BlockSparseAttnForwardSm100Blk128:
         pack_gqa: Optional[bool] = None,
         allow_empty_block_nums: bool = False,
         has_block_sizes: bool = True,
+        block_causal: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -114,6 +115,7 @@ class BlockSparseAttnForwardSm100Blk128:
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.block_causal = block_causal
         self.qhead_per_kvhead = qhead_per_kvhead
         if pack_gqa is None:
             pack_gqa = qhead_per_kvhead > 1
@@ -815,6 +817,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 mBlockSizes=mBlockSizes,
                 block_sparse_num=block_sparse_num,
                 mBlockNums=mBlockNums,
+                seqlen_k=Int32(mK.shape[0]),
             )
 
             stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
@@ -963,7 +966,12 @@ class BlockSparseAttnForwardSm100Blk128:
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
             # When mBlockNums is provided, raw count may be odd; round up to even for kernel loops.
             # max_i clamps phantom block indices to the last valid entry.
-            if const_expr(mBlockNums is not None):
+            if const_expr(self.block_causal):
+                raw_block_count = m_block + Int32(1)
+                process_tile = True
+                block_iter_count = (raw_block_count + 1) & ~1
+                n_block = partial(identity_k_block_index, max_i=raw_block_count - 1)
+            elif const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
                 process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
                 block_iter_count = (raw_block_count + 1) & ~1
@@ -1103,7 +1111,11 @@ class BlockSparseAttnForwardSm100Blk128:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls()
 
-            if const_expr(mBlockNums is not None):
+            if const_expr(self.block_causal):
+                raw_block_count = m_block + Int32(1)
+                process_tile = True
+                block_iter_count = (raw_block_count + 1) & ~1
+            elif const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
                 process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
                 block_iter_count = (raw_block_count + 1) & ~1
@@ -1260,6 +1272,7 @@ class BlockSparseAttnForwardSm100Blk128:
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
+        seqlen_k: Int32,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1303,7 +1316,11 @@ class BlockSparseAttnForwardSm100Blk128:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
-            if const_expr(mBlockNums is not None):
+            if const_expr(self.block_causal):
+                raw_block_count = m_block + Int32(1)
+                has_work = True
+                n_block = partial(identity_k_block_index, max_i=raw_block_count - 1)
+            elif const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
                 has_work = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
@@ -1343,7 +1360,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 # block_iter_count is even: each WG processes exactly half the blocks
                 # WG0 (stage=0): logical indices N-1, N-3, ... (stride 2)
                 # WG1 (stage=1): logical indices N-2, N-4, ... (stride 2)
-                if const_expr(mBlockNums is not None):
+                if const_expr(self.block_causal or mBlockNums is not None):
                     block_iter_count = (raw_block_count + 1) & ~1
                 else:
                     block_iter_count = block_sparse_num
@@ -1353,7 +1370,20 @@ class BlockSparseAttnForwardSm100Blk128:
 
                 # 1st block — phantom block (logical_first >= raw_block_count) uses block_size=0
                 n_block_first = n_block(logical_first)
-                if const_expr(self.has_block_sizes):
+                if const_expr(self.block_causal):
+                    first_block_size = (
+                        Int32(0)
+                        if logical_first >= raw_block_count
+                        else cutlass.min(Int32(self.n_block_size), seqlen_k - n_block_first * Int32(self.n_block_size))
+                    )
+                    first_mask_fn = partial(
+                        apply_block_causal_boundary_mask,
+                        block_size=first_block_size,
+                        q_row=tidx,
+                        is_boundary=n_block_first == m_block,
+                        n_block_size=self.n_block_size,
+                    )
+                elif const_expr(self.has_block_sizes):
                     first_block_size = Int32(0) if const_expr(mBlockNums is not None) and logical_first >= raw_block_count else mBlockSizes[n_block_first]
                     first_mask_fn = partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size)
                 elif const_expr(mBlockNums is not None):
@@ -1373,7 +1403,9 @@ class BlockSparseAttnForwardSm100Blk128:
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
                     logical_n = logical_first - self.s_stage * (n_tile + 1)
                     n_block_cur = n_block(logical_n)
-                    if const_expr(self.has_block_sizes):
+                    if const_expr(self.block_causal):
+                        remaining_mask_fn = None
+                    elif const_expr(self.has_block_sizes):
                         remaining_mask_fn = partial(apply_block_size_mask, block_size=mBlockSizes[n_block_cur], n_block_size=self.n_block_size)
                     else:
                         remaining_mask_fn = None
@@ -1526,7 +1558,9 @@ class BlockSparseAttnForwardSm100Blk128:
             # For q_stage=1, always need row_max for combine; use -inf as default
             stats = [(Float32(0.0), -Float32.inf if const_expr(mLSE is not None or self.q_stage == 1) else None, True)] * self.s_stage
 
-            if const_expr(mBlockNums is not None):
+            if const_expr(self.block_causal):
+                has_work = True
+            elif const_expr(mBlockNums is not None):
                 has_work = mBlockNums[batch_idx, head_idx, m_block] > Int32(0) if const_expr(self.allow_empty_block_nums) else True
             else:
                 has_work = True
@@ -1540,7 +1574,9 @@ class BlockSparseAttnForwardSm100Blk128:
                 sm_stats_consumer_phase ^= 1
 
                 # q_stage=1 correction loop
-                if const_expr(mBlockNums is not None):
+                if const_expr(self.block_causal):
+                    block_iter_count = (m_block + Int32(2)) & ~1
+                elif const_expr(mBlockNums is not None):
                     block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
                 else:
                     block_iter_count = block_sparse_num
@@ -2362,3 +2398,23 @@ def apply_block_size_mask(
             lambda s: predicate_bitmask_below(block_size, s),
             rank1=True,
         )
+
+
+@cute.jit
+def apply_block_causal_boundary_mask(
+    acc_S: cute.Tensor,
+    block_size: Int32,
+    q_row: Int32,
+    is_boundary: cutlass.Boolean,
+    n_block_size: cutlass.Constexpr[int] = 128,
+) -> None:
+    """At Q128/K128 diagonal, the first Q64 half sees only its K64 half."""
+    visible_cols = block_size
+    if is_boundary and q_row < Int32(64):
+        visible_cols = cutlass.min(block_size, Int32(64))
+    apply_block_size_mask(acc_S, visible_cols, n_block_size)
+
+
+@cute.jit
+def identity_k_block_index(i: Int32, max_i: Int32) -> Int32:
+    return cutlass.min(i, max_i)
