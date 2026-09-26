@@ -573,11 +573,13 @@ def _empty_bwd_workspace_with_zeroed_accum(
     round_d_to: int,
     zero_dq_accum: bool,
     device: torch.device,
+    include_dkv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
-    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + 2 * k_rounded * d_rounded
+    dkv_accum_elems = 2 * k_rounded * d_rounded if include_dkv_accum else 0
+    elems_per_bh = 2 * q_rounded + q_rounded * d_rounded + dkv_accum_elems
     workspace = torch.empty(
         (
             batch_size,
@@ -589,8 +591,8 @@ def _empty_bwd_workspace_with_zeroed_accum(
     )
     # The (B, H, elems_per_bh) allocation shape is NOT how the kernels read this
     # buffer. They split the raw pointer field-major across all N = B * H entries:
-    #   [all N dPsum][all N LSE][all N dQ accum][all N dK accum][all N dV accum]
-    # so the flat start of each field is N * (per-BH elements of the preceding
+    #   [all N dPsum][all N LSE][all N dQ accum][optional dK/dV accum].
+    # The flat start of each field is N * (per-BH elements of the preceding
     # fields), and the accumulator tail must be zeroed on the flattened view.
     # Rewriting this as workspace[..., accum_offset:].zero_() (per-(B,H) rows)
     # would zero the wrong bytes for B * H > 1.
@@ -2467,12 +2469,32 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         return dq, dk, dv
 
+    has_provided_dkv = dk is not None or dv is not None
     if dq is None:
         dq = torch.empty_like(q)
     if dk is None:
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
+
+    # A single Q group gives each K block one CTA and therefore one dK/dV
+    # writer. Keep the accumulator path if caller-provided outputs alias an
+    # input or metadata tensor that the kernel may still read.
+    dkv_overlaps_input = has_provided_dkv and any(
+        torch._C._overlaps(gradient, source)
+        for gradient in (dk, dv)
+        for source in (
+            dout, q, k, v, out, lse,
+            q2k_block_index, q2k_block_nums, block_sizes,
+            variable_block_sizes, bucketed_k2q_offsets, bucketed_k2q_indices,
+        )
+        if source is not None
+    )
+    direct_dkv = _num_q_groups == 1 and not dkv_overlaps_input
+    if direct_dkv:
+        # K blocks with no Q edges do not launch a writer.
+        dk.zero_()
+        dv.zero_()
 
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=batch_size,
@@ -2485,6 +2507,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         round_d_to=8,
         zero_dq_accum=True,
         device=q.device,
+        include_dkv_accum=not direct_dkv,
     )
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
@@ -2497,6 +2520,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         sparse_block_size,
         arch,
         has_block_sizes,
+        direct_dkv,
         _tensor_layout_compile_key(dout),
         _tensor_layout_compile_key(out),
         _tensor_layout_compile_key(q),
@@ -2533,6 +2557,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
+            atomic_dkv=not direct_dkv,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
