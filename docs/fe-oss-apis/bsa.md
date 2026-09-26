@@ -4,8 +4,8 @@
 
 ## Overview
 
-Block Sparse Attention computes non-causal scaled dot-product attention over a
-block-level sparse pattern. For query token `i`, let `m = floor(i / block_size)`
+Block Sparse Attention computes scaled dot-product attention over a block-level
+sparse pattern. For query token `i`, let `m = floor(i / block_size)`
 be its query-block index and let `K_m` be the union of the key/value blocks
 listed for that query block. The operation is
 
@@ -138,6 +138,23 @@ falls back to a smaller split count when the estimated live workspace does not
 fit the available CUDA allocator budget; an explicit split count that exceeds
 that budget raises `RuntimeError`.
 
+### Exact block-causal forward on SM100/SM103
+
+For the exact 64-token block-causal pattern
+`floor(k / 64) <= floor(q / 64)`, pass `block_causal=True` and
+`sparse_block_size=64`. The Q128 fast path shares K/V work across two adjacent
+Q64 blocks while preserving the original block-level mask: tokens within one
+diagonal 64-token block can attend to each other. This differs from token-level
+causal masking.
+
+The caller must supply the exact causal `q2k_block_index` prefixes and
+per-Q64 `q2k_block_nums`; the wrapper does not copy GPU metadata to the host to
+verify the pattern. This route requires BF16 MHA, QK and V dimensions of 128,
+equal Q/K sequence lengths, `block_sizes=None`, `allow_empty_block_nums=False`,
+`kv_splits=1`, unpacked heads, and the default `use_clc=None`. The final partial
+block is masked using the true sequence length. Arbitrary sparse patterns
+continue to use the default blk64 forward kernel.
+
 ## Sage FP8 forward
 
 Sage FP8 is a forward-only blk64 path. Its public wrapper accepts contiguous
@@ -209,8 +226,10 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default. On SM100/SM103, setting the split backend's bucket size to
 at least the number of Q blocks creates one Q group. In that specialization
-each `(batch, head, K block)` has one writer, so dK/dV use ordinary FP32 stores
-instead of global atomics. Multi-group configurations retain the atomic path.
+each `(batch, head, K block)` has one writer, so the SM100/SM103 blk64 kernel
+writes BF16 dK/dV directly without FP32 accumulation workspace or a dK/dV
+conversion kernel. Multi-group configurations retain FP32 atomic accumulation
+and conversion.
 
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
@@ -250,7 +269,7 @@ dQ accumulator workspace.
 | --- | ---: | --- | --- | --- |
 | SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
 | SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
-| SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
+| SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA, exact block-causal fast path |
 | SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
@@ -277,7 +296,7 @@ does not currently support GQA/MQA.
 
 ## Limitations
 
-The current sparse kernels do not implement causal or local masking, dropout,
+The general sparse kernels do not implement token-causal or local masking, dropout,
 `mask_mod`, `score_mod`, paged KV cache, softcap, or variable-length packed
 sequences. Regular forward/backward inputs must be rank four, use FP16/BF16 as
 allowed above, and have a contiguous last (head-dimension) axis. Sage FP8 uses

@@ -152,6 +152,44 @@ def test_bsa_attention_backward_sm100_blk64(num_q_blocks):
     torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
 
+    if num_q_blocks == 2:
+        # Metadata can also be a view into a caller-provided output buffer.
+        dk_storage = torch.empty_like(k)
+        sizes_in_dk = dk_storage.view(torch.int32).flatten()[: block_sizes.numel()]
+        sizes_in_dk.copy_(block_sizes)
+        metadata_aliased = BSA.block_sparse_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            forward["o_tensor"],
+            forward["lse_tensor"],
+            q2k,
+            block_sparse_num,
+            sizes_in_dk,
+            dk_tensor=dk_storage,
+            sparse_block_size=64,
+        )
+        torch.testing.assert_close(metadata_aliased["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
+
+        # The caller may reuse K storage for dK. The direct-output path must
+        # preserve K until the last backward kernel finishes reading it.
+        aliased = BSA.block_sparse_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            forward["o_tensor"],
+            forward["lse_tensor"],
+            q2k,
+            block_sparse_num,
+            block_sizes,
+            dk_tensor=k,
+            sparse_block_size=64,
+        )
+        assert aliased["dk_tensor"].data_ptr() == k.data_ptr()
+        torch.testing.assert_close(k.float(), dk_ref, atol=3e-2, rtol=3e-2)
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=17)
@@ -203,8 +241,10 @@ def test_bsa_attention_backward_sm100_blk64_split_irregular(
             count_h1 = counts_host[1][row]
             q2k[batch_idx, 0, row, :count_h0] = ids.roll(batch_idx).flip(0)[:count_h0]
             q2k[batch_idx, 1, row, :count_h1] = ids.roll(row + batch_idx)[:count_h1]
+    # K block sizes are shared across batches by the public API. Preserve
+    # irregular sizes while checking distinct sparse rows for each batch.
     block_sizes = torch.tensor(
-        [[64, 30, 48, 40, 13, 51, 29], [55, 64, 23, 48, 32, 41, 19]],
+        [64, 30, 48, 40, 13, 51, 29],
         dtype=torch.int32,
         device="cuda",
     )

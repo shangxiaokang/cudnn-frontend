@@ -199,14 +199,17 @@ class BlockSparseAttnBackwardSm100Blk64:
         sum_OdO_iter = workspace.iterator
         scaled_lse_iter = sum_OdO_iter + sum_OdO_elems
         dQ_acc_iter = scaled_lse_iter + scaled_lse_elems
-        if cutlass.const_expr(self.compute_dq):
-            dK_acc_iter = dQ_acc_iter + cute.assume(B_i64 * H_i64 * Q_i64 * D_i64, divby=4)
+        if cutlass.const_expr(self.atomic_dkv):
+            if cutlass.const_expr(self.compute_dq):
+                dK_acc_iter = dQ_acc_iter + cute.assume(B_i64 * H_i64 * Q_i64 * D_i64, divby=4)
+            else:
+                dK_acc_iter = dQ_acc_iter
+            dV_acc_iter = dK_acc_iter + cute.assume(B_i64 * H_i64 * K_i64 * D_i64, divby=4)
         else:
-            # The Q-major split kernel writes dQ directly.  Alias its unused
-            # descriptor at the dK base instead of reserving a ~500 MiB FP32
-            # dQ accumulator for the production shape.
-            dK_acc_iter = dQ_acc_iter
-        dV_acc_iter = dK_acc_iter + cute.assume(B_i64 * H_i64 * K_i64 * D_i64, divby=4)
+            # The unique-writer path stores BF16 dK/dV directly. These
+            # descriptors are unused placeholders inside the compact workspace.
+            dK_acc_iter = sum_OdO_iter
+            dV_acc_iter = sum_OdO_iter
 
         sum_OdO_iter = cute.recast_ptr(sum_OdO_iter, dtype=self.acc_dtype)
         scaled_lse_iter = cute.recast_ptr(scaled_lse_iter, dtype=self.acc_dtype)
@@ -552,6 +555,11 @@ class BlockSparseAttnBackwardSm100Blk64:
         self.shared_storage = SharedStorage
 
         sum_OdO, scaled_LSE, dQ_acc, dK_acc, dV_acc = self.get_workspace_tensor(problem_shape, workspace)
+        dK_store = dK_acc
+        dV_store = dV_acc
+        if cutlass.const_expr(not self.atomic_dkv):
+            dK_store = dK
+            dV_store = dV
 
         dQ_smem_layout = cute.select(fake_dQ_smem_layout_staged, mode=[0, 1])
 
@@ -604,8 +612,8 @@ class BlockSparseAttnBackwardSm100Blk64:
             tma_tensor_dO,
             tma_atom_dQ_acc,
             tma_tensor_dQ_acc,
-            dK_acc,
-            dV_acc,
+            dK_store,
+            dV_store,
             scaled_LSE,
             scale_softmax,
             sum_OdO,
@@ -654,24 +662,25 @@ class BlockSparseAttnBackwardSm100Blk64:
         ]
         convert_block = [self.num_threads_D_convert, self.num_threads_seq, 1]
 
-        self.convert(
-            dQ_acc,
-            dK_acc,
-            dV_acc,
-            dQ,
-            dK,
-            dV,
-            problem_shape[0],
-            problem_shape[1],
-            problem_shape[2],
-            scale_softmax,
-        ).launch(
-            grid=convert_grid,
-            block=convert_block,
-            cluster=[1, 1, 1],
-            smem=0,
-            stream=stream,
-        )
+        if cutlass.const_expr(self.compute_dq or self.atomic_dkv):
+            self.convert(
+                dQ_acc,
+                dK_acc,
+                dV_acc,
+                dQ,
+                dK,
+                dV,
+                problem_shape[0],
+                problem_shape[1],
+                problem_shape[2],
+                scale_softmax,
+            ).launch(
+                grid=convert_grid,
+                block=convert_block,
+                cluster=[1, 1, 1],
+                smem=0,
+                stream=stream,
+            )
 
     @cute.kernel
     def sum_OdO(
@@ -1073,7 +1082,7 @@ class BlockSparseAttnBackwardSm100Blk64:
                     dQ_acc_frg = dQ_acc_bhs[None, idx_d].load()
                     dQ_acc_frg = scale_softmax * dQ_acc_frg
                     dQ_bhs[None, idx_d].store(dQ_acc_frg.to(self.element_dtype))
-            if idx_s < k_count:
+            if cutlass.const_expr(self.atomic_dkv) and idx_s < k_count:
                 dK_acc_bhs = dK_acc[None, idx_s, (h_idx, b_idx)]
                 dK_acc_bhs = cute.logical_divide(dK_acc_bhs, cute.make_layout(self.convert_elem_per_load))
                 dV_acc_bhs = dV_acc[None, idx_s, (h_idx, b_idx)]
@@ -2022,6 +2031,7 @@ class BlockSparseAttnBackwardSm100Blk64:
             tdKTtdKT,
             tdVTtdVT,
             kv_block_idx,
+            scale_softmax,
             (mma_compute_dKdV_pipeline, mma_compute_dKdV_consumer_state),
         )
 
@@ -2163,6 +2173,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         tdKTtdKT: cute.Tensor,
         tdVTtdVT: cute.Tensor,
         kv_block_idx: Int32,
+        scale_softmax: Float32,
         # (mma_compute_dKdV_pipeline, mma_compute_dKdV_consumer_state)
         pipeline_args: tuple,
     ):
@@ -2220,7 +2231,7 @@ class BlockSparseAttnBackwardSm100Blk64:
         # Load tdVtdVT
         cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
 
-        self.store_dkv_fp32(tTR_gdV, tTR_rdV, tTR_cdV, (D, K))
+        self.store_dkv(tTR_gdV, tTR_rdV, tTR_cdV, (D, K), Float32(1.0))
 
         cute.arch.fence_view_async_tmem_load()
 
@@ -2231,19 +2242,20 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
 
-        self.store_dkv_fp32(tTR_gdK, tTR_rdK, tTR_cdK, (D, K))
+        self.store_dkv(tTR_gdK, tTR_rdK, tTR_cdK, (D, K), scale_softmax)
 
         cute.arch.fence_view_async_tmem_load()
         mma_compute_dKdV_pipeline.consumer_release(mma_compute_dKdV_consumer_state)
         mma_compute_dKdV_consumer_state.advance()
 
     @cute.jit
-    def store_dkv_fp32(
+    def store_dkv(
         self,
         gmem: cute.Tensor,
         regs: cute.Tensor,
         coord: cute.Tensor,
         tensor_shape: cute.Shape,
+        scale: Float32,
     ):
         # Store a complete tile, or atomically add a multi-group partial.
         copy_atom = cute.make_copy_atom(
@@ -2285,7 +2297,7 @@ class BlockSparseAttnBackwardSm100Blk64:
                                     scope="gpu",
                                 )
                             else:
-                                ptr.store(tCr[coord])
+                                ptr.store((tCr[coord] * scale).to(self.element_dtype))
 
     @cute.jit
     def split_wg(
