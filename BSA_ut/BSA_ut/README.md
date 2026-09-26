@@ -82,7 +82,7 @@ BSA_PYTHON=/path/to/bsa/bin/python CAUSAL_PYTHON=/path/to/causal/bin/python \
 | `--case` | `blk64` | `flex` | `split` | 未指定时默认值 |
 | --- | --- | --- | --- | --- |
 | `bsa-causal` | 支持 | 支持 | 支持 | `flex` |
-| `production` | 支持 | 不支持 | 支持 | `split` |
+| `production` | 支持 | 不支持 | 支持 | `blk64` |
 
 其中 `blk64` 是 BSA API 中 `backward_backend="fused"` 的测试侧名称。当前 Flex
 快路径只实现精确的 block-causal-64 mask；production 的任意稀疏 mask 不能使用该路径，
@@ -156,12 +156,12 @@ audio 可见 text 和自身 audio。10% 是视频候选块比例，不是整个 
 视频按 `1×8×8` cube 排列，每块有效 token 前置。Top-K 按有效 token 的 Q/K block mean 打分，
 同分优先较小块编号。输入为合成数据，Q/K/V seed=0、dO seed=1，输入 padding 和 padded query 的 dO 清零。
 
-## Production split backward
+## Production backward
 
-The production benchmark defaults to the exact block64 split backward:
-K-major CuTe computes dK/dV, while Q-major Triton accumulates dQ once per
-Q64 row. Compare it with the fused baseline and validate all gradients before
-accepting a performance result:
+The production benchmark defaults to the fused block64 backward with a single
+3991-block bucket for the bundled mask. The optional exact split backend uses
+K-major CuTe for dK/dV and Q-major Triton for dQ. Compare the two backends and
+validate all gradients before accepting a performance result:
 
 ```bash
 # Correctness gate on the full production fixture
@@ -195,6 +195,56 @@ five-matmul (10D per visible pair) convention. Split physically executes about
 14D per pair: 8D in the dKV kernel plus 6D in the Q-major dQ kernel. Therefore
 its reported MFU is a baseline-comparison metric, not physical Tensor Core MFU.
 
+### B300 单卡复测
+
+在已分配的 B300 节点上，可用同一份 Q/K/V、mask 和 O/LSE 对照 fused 与 split：
+
+```bash
+cd /home/scratch.xshang_wwfo/BSA_Kernel/cudnn-frontend/BSA_ut/BSA_ut
+bash run_b300_sweep.sh --backends fused split --buckets 3991 \
+  --block-n 32 --verify --warmup 5 --runs 9
+```
+
+脚本默认使用 `/home/scratch.xshang_wwfo/BSA_Kernel/.venv/bsa/bin/python`；若
+环境装在别处，用 `BSA_ROOT` 和 `BSA_PYTHON` 指定工作目录与 Python。
+
+2026-09-26 在 B300 SXM6 AC 上，以每次采样前清 L2 的 CUDA Event 中位数测得
+fused **19.228 ms**、split **29.172 ms**；三项梯度最大绝对差不超过 0.00195312。
+这些是完整 backward 调用耗时；生产默认选 fused，脚本将
+`--bucket-size-blocks` 设为 3991。通用 BSA API 的自动 bucket 策略仍针对未知稀疏图保留。
+同机复测 fused 的 bucket 3991、2048、1024 分别为 **18.668、19.323、
+19.940 ms**（3 次预热、7 次测量）；对这份 fixture，显式 3991 比 API 自动
+选用的 1024 快约 6.4%。调用方若使用相同生产 mask，应显式传入 3991。
+由原先脚本默认的 split 切到 fused，使这组数据的完整 backward 耗时降低 34.1%；
+这是选择已有 backend 的收益，并非 fused kernel 本身提升 34.1%。
+
+为确认源码改动的效果，在另一台 B300 `umb-b300-dp-147` 上分别安装干净的
+`v1.29.0` tag (`91dbf3e9`) 和当前分支 (`da5af6ff`)，使用相同 production
+fixture、seed、3991 bucket、每次采样前清 L2、5 次预热和 9 次测量。
+tag 的 forward/backward 为 **5.667/18.875 ms**，主 backward kernel 为
+**17.021 ms**；当前分支对应 **5.669/19.098 ms** 和 **17.242 ms**。
+这组同机结果没有显示当前分支的 fused kernel 比 tag 快；约 1% 的差异不应
+单独解读为稳定回退。30% kernel 提速目标仍未达到。
+
+主 kernel 的 NCU 采样约 17.345 ms，每 CTA 使用 512 threads、128 registers/thread、
+199680 B dynamic shared memory 和 512 TMEM columns，限制为每 SM 一个 CTA。
+L1/TEX、L2、DRAM throughput 分别约 78.28%、65.24%、6.32%；主要等待是
+L1TEX scoreboard 依赖。单独减少全局访问 sectors、CSR lookahead、调整流水线
+stage 或提前发起 S MMA 的试验均未产生可复现的时延收益，因此这些候选改动
+没有并入源码。
+另在隔离副本中用 8 KiB shared memory 预载每 CTA 的 CSR Q 索引，梯度与
+split 对照的最大绝对差为 0.00195312；同卡完整 backward 为 baseline
+18.888 ms、候选 19.386 ms、baseline 重测 19.000 ms，主 kernel 的单次
+profiler 耗时均约 17.35 ms。该候选也未并入源码。
+
+同一台 `umb-b300-dp-148` 上的 causal 参考值如下（每次采样前清 L2，
+3 次预热、7 次测量）：S=4096 时，native causal forward/backward 为
+**0.088/0.331 ms**，BSA block causal 为 **0.152/0.339 ms**；S=255424 时，
+native 为 **44.568/134.554 ms**，BSA 为 **61.519/132.080 ms**。
+长序列上 BSA causal backward 已接近 native，而 forward 仍慢约 38%。
+两者的对角 64×64 块语义不同：BSA block causal 保留整块，native causal
+仅保留下三角；这些数字是性能参考，不能作为输出等价性验证。
+
 ## Profiling
 
 安装 NVIDIA Nsight Compute 后，可仅采集生产用例的一次反向：
@@ -207,6 +257,14 @@ ncu --nvtx --nvtx-include 'BSA_ut__production__bwd' \
 
 NVTX 名称为 `BSA_ut__<case>__fwd` / `BSA_ut__<case>__bwd`，过滤表达式不带末尾 `/`。
 结果为 `production_bwd.ncu-rep`；性能基线使用普通运行的耗时，不使用 NCU 采集期间的耗时。
+也可用 `benchmark.py --case production --profile-bwd-kernels` 在计时后额外
+采样一次 backward，打印各 CUDA kernel 的耗时。
+
+单卡 B300 工作目录中的 Nsight Compute 采样可用 `profile_b300_ncu.sh`；脚本默认
+从 `$BSA_ROOT/profiler/` 读取 `ncu`，也可通过 `NCU=/path/to/ncu` 覆盖。导出的
+报告使用带时间戳的前缀，避免覆盖旧采样；可通过 `PROFILE_PREFIX` 指定路径。
+运行时打印的 `<prefix>_source.csv` 可用
+`python analyze_ncu_source.py <prefix>_source.csv` 汇总 SASS 层的访存和等待计数。
 
 三组用例已在 GB200（L20A）、Torch 2.10 / CUDA 13.1 环境完成前后向性能运行。
 `--verify-bsa-causal-backend`（旧别名 `--verify-fastpath`）验证 block-causal backend；

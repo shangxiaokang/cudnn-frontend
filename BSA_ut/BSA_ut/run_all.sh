@@ -5,7 +5,7 @@ if [[ $# != 1 || "$1" == --help ]]; then
     echo 'Usage: bash run_all.sh CLOCK_MHZ'
     echo 'Example: GPU=0 bash run_all.sh 2032'
     echo 'Optional: WARMUP=5 RUNS=10 BSA_CAUSAL_BWD_BACKEND=blk64|split QMAJOR_BLOCK_N=32|64 BUCKET_SIZE_BLOCKS=...'
-    echo 'Backend default when unset: bsa-causal=flex, production=split; run bsa-causal directly to select flex explicitly.'
+    echo 'Backend default when unset: bsa-causal=flex, production=blk64; run bsa-causal directly to select flex explicitly.'
     [[ "${1:-}" == --help ]] && exit 0
     exit 2
 fi
@@ -67,7 +67,7 @@ if [[ "$QMAJOR_BLOCK_N" != "32" && "$QMAJOR_BLOCK_N" != "64" ]]; then
     echo "QMAJOR_BLOCK_N must be 32 or 64" >&2
     exit 2
 fi
-BACKEND_CONFIG="${BSA_CAUSAL_BWD_BACKEND:-case-defaults(bsa-causal=flex,production=split)}"
+BACKEND_CONFIG="${BSA_CAUSAL_BWD_BACKEND:-case-defaults(bsa-causal=flex,production=blk64)}"
 echo "GPU=$GPU CLOCK_MHZ=$CLOCK_MHZ WARMUP=$WARMUP RUNS=$RUNS BSA_CAUSAL_BWD_BACKEND=$BACKEND_CONFIG QMAJOR_BLOCK_N=$QMAJOR_BLOCK_N BUCKET_SIZE_BLOCKS=${BUCKET_SIZE_BLOCKS:-auto}" | tee "$LOG_DIR/config.log"
 echo "BSA_PYTHON=$BSA_PYTHON CAUSAL_PYTHON=$CAUSAL_PYTHON" | tee -a "$LOG_DIR/config.log"
 nvidia-smi -i "$GPU" -q > "$LOG_DIR/gpu_before.log"
@@ -98,7 +98,7 @@ for case in causal bsa-causal production; do
             if [[ "$case" == bsa-causal ]]; then
                 effective_backend=flex
             else
-                effective_backend=split
+                effective_backend=blk64
             fi
         fi
         case_args+=(--bsa-causal-bwd-backend "$effective_backend")

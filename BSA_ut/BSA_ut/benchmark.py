@@ -21,7 +21,30 @@ NUM_HEADS = 4
 HEAD_DIM = 128
 
 
-def measure(fn, label, warmup, runs, flush):
+def print_bwd_kernel_profile(prof):
+    kernels = []
+    for event in prof.key_averages():
+        if getattr(event.device_type, "name", None) != "CUDA":
+            continue
+        total_us = event.self_device_time_total
+        if total_us <= 0:
+            continue
+        kernels.append((total_us, event.key, event.count))
+
+    kernels.sort(reverse=True)
+    print("Backward CUDA kernels (one additional profiled call):", flush=True)
+    print(f"{'total_ms':>10s}  {'avg_ms':>10s}  {'calls':>7s}  name", flush=True)
+    for total_us, name, count in kernels:
+        print(
+            f"{total_us / 1000:10.3f}  {total_us / count / 1000:10.3f}  "
+            f"{count:7d}  {name}",
+            flush=True,
+        )
+    if not kernels:
+        print("No CUDA kernels were captured.", flush=True)
+
+
+def measure(fn, label, warmup, runs, flush, profile_bwd_kernels=False):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -39,7 +62,22 @@ def measure(fn, label, warmup, runs, flush):
         end.synchronize()
         samples.append(start.elapsed_time(end))
         del result
-    return statistics.median(samples)
+    median_ms = statistics.median(samples)
+    if profile_bwd_kernels:
+        # Keep profiler overhead and the L2 flush outside the timed samples.
+        flush.add_(1)
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        ) as prof:
+            result = fn()
+            torch.cuda.synchronize()
+        del result
+        print_bwd_kernel_profile(prof)
+    return median_ms
 
 
 def run_case(case, args, flush):
@@ -184,7 +222,14 @@ def run_case(case, args, flush):
             del candidate, baseline
 
     fwd_ms = measure(forward, f"BSA_ut__{case}__fwd", args.warmup, args.runs, flush)
-    bwd_ms = measure(backward, f"BSA_ut__{case}__bwd", args.warmup, args.runs, flush)
+    bwd_ms = measure(
+        backward,
+        f"BSA_ut__{case}__bwd",
+        args.warmup,
+        args.runs,
+        flush,
+        profile_bwd_kernels=args.profile_bwd_kernels,
+    )
     # Count after timing: metadata analysis must not enter the measured region.
     if case == "causal":
         pairs = BATCH_SIZE * NUM_HEADS * seqlen * (seqlen + 1) // 2
@@ -210,6 +255,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument(
+        "--profile-bwd-kernels",
+        action="store_true",
+        help="Profile one extra backward call and print CUDA kernel times after timing",
+    )
+    parser.add_argument(
         "--bsa-causal-bwd-backend",
         choices=("blk64", "flex", "split"),
         default=None,
@@ -217,7 +267,7 @@ def main():
             "Backward implementation for bsa-causal or production: the general "
             "64x64 fused BSA kernel, the exact block-causal Flex/FA4 fast path, "
             "or the exact Q-major split dQ path (defaults: bsa-causal=flex, "
-            "production=split; production does not support flex)"
+            "production=blk64; production does not support flex)"
         ),
     )
     parser.add_argument(
@@ -252,7 +302,7 @@ def main():
         if args.bsa_causal_bwd_backend is not None:
             parser.error("--bsa-causal-bwd-backend applies only to --case bsa-causal or production")
     elif args.bsa_causal_bwd_backend is None:
-        args.bsa_causal_bwd_backend = "flex" if args.case == "bsa-causal" else "split"
+        args.bsa_causal_bwd_backend = "flex" if args.case == "bsa-causal" else "blk64"
     if args.case == "production" and args.bsa_causal_bwd_backend == "flex":
         parser.error(
             "the Flex backend supports only the exact block-causal-64 mask; "
@@ -269,13 +319,13 @@ def main():
         parser.error("blk64 is already the production verification baseline")
     if (
         args.case == "production"
-        and args.bsa_causal_bwd_backend == "split"
+        and args.bsa_causal_bwd_backend in ("blk64", "split")
         and args.bucket_size_blocks is None
     ):
         # The bundled mask has 3991 Q64 blocks and enough K-major parallelism
-        # for one group.  This explicitly enables the unique-writer dK/dV
-        # specialization without changing the generic library default for
-        # arbitrary sparse graphs with an unknown column-degree tail.
+        # for one group.  The full bucket avoids redundant K-major groups in
+        # the fused path and enables unique-writer dK/dV in the split path.
+        # Keep the generic library default for arbitrary sparse graphs.
         padded_tokens = int(load_fixture()["padded_tokens"])
         args.bucket_size_blocks = (padded_tokens + 63) // 64
     if (
@@ -301,6 +351,10 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name()}; Torch: {torch.__version__}; CUDA: {torch.version.cuda}")
     package = "flash-attn-cute" if args.case == "causal" else "nvidia-cudnn-frontend"
     print(f"{package}: {version(package)}; CUTLASS DSL: {version('nvidia-cutlass-dsl')}")
+    if args.case != "causal":
+        import cudnn
+
+        print(f"cuDNN import: {cudnn.__file__}")
     print(f"BF16 BSHD, B={BATCH_SIZE} H={NUM_HEADS} D={HEAD_DIM}; median milliseconds; L2 flushed per sample")
     if args.case == "bsa-causal":
         suffix = (
