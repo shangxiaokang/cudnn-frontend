@@ -104,10 +104,10 @@ class BlockSparseAttnBackwardSm100Blk64:
         self.tmem_S_offset = self.tmem_dP_offset + self.dSK_mma_tiler[1]  # 128 + 128 = 256
 
         self.num_regs_reduce = 152
-        self.num_regs_compute = 128
-        self.num_regs_mma = 96
-        self.num_regs_empty = 96
-        self.num_regs_load = 96
+        # Keep the MMA/load warpgroup at the launch allocation of 128
+        # registers. Reducing the compute warpgroups supplies the reducer's
+        # extra registers without spilling MMA state to local memory.
+        self.num_regs_compute = 112
 
         self.buffer_align_bytes = 1024
 
@@ -804,7 +804,6 @@ class BlockSparseAttnBackwardSm100Blk64:
 
         if task_has_work:
             if warp_idx == self.load_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_load)
                 self.load(
                     Q_in,
                     K_in,
@@ -833,8 +832,6 @@ class BlockSparseAttnBackwardSm100Blk64:
                     (load_mma_Q_pipeline, load_compute_LSE_pipeline, load_mma_dO_pipeline, load_compute_sum_OdO_pipeline),
                 )
             elif warp_idx == self.mma_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_mma)
-
                 tmem.allocate(self.tmem_alloc_cols)
                 # Barrier before retrieve tensor memory ptr from shared memory
                 tmem.wait_for_alloc()
@@ -895,7 +892,7 @@ class BlockSparseAttnBackwardSm100Blk64:
                     ),
                 )
             elif warp_idx in self.compute_warp_id:
-                cute.arch.setmaxregister_increase(self.num_regs_compute)
+                cute.arch.setmaxregister_decrease(self.num_regs_compute)
                 tmem.wait_for_alloc()
                 # Retrieve tmem ptr
                 tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
@@ -972,8 +969,6 @@ class BlockSparseAttnBackwardSm100Blk64:
                     reduce_iter_count,
                     (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline),
                 )
-            else:
-                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
     @cute.kernel
     def convert(
