@@ -226,6 +226,13 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
+For the SM100/SM103 blk64 path, `bucket_size_blocks >= ceil(S_q / 64)` places
+all Q blocks in one group. Each KV block then has a single backward CTA, so
+the kernel can write BF16 dK/dV directly without FP32 dK/dV accumulators.
+Caller-provided dK/dV buffers that overlap an input or sparse metadata use the
+regular accumulation path. Measure both group sizes for a new sparse pattern:
+a single group reduces dK/dV storage work but changes CTA parallelism.
+
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
 path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
