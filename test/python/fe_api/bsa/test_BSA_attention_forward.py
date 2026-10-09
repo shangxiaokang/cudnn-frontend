@@ -26,6 +26,43 @@ def _import_bsa():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "misalignment,tensor_index,kv_splits",
+    [
+        ("contiguous", 0, 1),
+        ("aligned_stride", 1, 1),
+        ("stride", 1, 1),
+        ("address", 2, 2),
+    ],
+)
+def test_bsa_attention_forward_sm100_blk64_bshd_sliced_inputs(misalignment, tensor_index, kv_splits):
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
+        pytest.skip("BSHD TMA layout test requires SM100/SM103")
+
+    BSA = _import_bsa()
+    torch.manual_seed(20260911)
+    inputs = [torch.randn((2, 64, 3, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    if misalignment != "contiguous":
+        padding = 1 if misalignment == "stride" else 8
+        start = 1 if misalignment == "address" else 0
+        storage = torch.empty((2, 64, 3, 128 + padding), device="cuda", dtype=torch.bfloat16)
+        sliced = storage[..., start : start + 128]
+        sliced.copy_(inputs[tensor_index])
+        inputs[tensor_index] = sliced
+
+    indices = torch.zeros((2, 3, 1, 1), device="cuda", dtype=torch.int32)
+    sizes = torch.full((1,), 64, device="cuda", dtype=torch.int32)
+    result = BSA.block_sparse_attention_forward(*inputs, indices, 1, sizes, sparse_block_size=64, layout="bshd", kv_splits=kv_splits)
+    canonical = [tensor.transpose(1, 2) for tensor in inputs]
+    mask = block_sparse_mask(indices, 1, sizes, 64, 64, 64)
+    ref_output, ref_lse = attention_reference(*canonical, mask)
+
+    assert result["o_tensor"].is_contiguous()
+    torch.testing.assert_close(result["o_tensor"].transpose(1, 2).float(), ref_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], ref_lse, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_bsa_attention_forward_fixed_blocks():
     BSA = _import_bsa()

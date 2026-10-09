@@ -117,6 +117,15 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _bshd_tma_compatible(t: torch.Tensor) -> bool:
+    """Check pointer and active outer-stride alignment before avoiding staging."""
+    return (
+        t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(size <= 1 or (stride > 0 and stride * t.element_size() % 16 == 0) for size, stride in zip(t.shape[:-1], t.stride()[:-1]))
+    )
+
+
 def _to_cute_tensor(
     t: torch.Tensor,
     assumed_align: Optional[int] = 16,
@@ -1342,9 +1351,9 @@ def bsa_attn_fwd_blk64_cutedsl(
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
     else:
         assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
+        q_bhsd = q.transpose(1, 2) if _bshd_tma_compatible(q) else q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2) if _bshd_tma_compatible(k) else k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2) if _bshd_tma_compatible(v) else v.transpose(1, 2).contiguous()
 
     batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
     seqlen_k = k_bhsd.shape[2]
@@ -1479,11 +1488,9 @@ def bsa_attn_fwd_blk64_cutedsl(
             device=q_bhsd.device,
         )
     else:
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
-            dtype=output_dtype,
-            device=q_bhsd.device,
-        )
+        out_shape = (batch_size, seqlen_q, num_head, head_dim_v) if layout == "bshd" else (batch_size, num_head, seqlen_q, head_dim_v)
+        out_native = torch.empty(out_shape, dtype=output_dtype, device=q_bhsd.device)
+        out_bhsd = out_native.transpose(1, 2) if layout == "bshd" else out_native
         lse = torch.empty(
             (batch_size, num_head, seqlen_q),
             dtype=torch.float32,
@@ -1610,7 +1617,9 @@ def bsa_attn_fwd_blk64_cutedsl(
         # Keep split_offsets alive through the combine launch on the same stream.
         _ = split_offsets
 
-    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
+    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2)
+    if layout == "bshd" and kv_splits_i > 1:
+        out = out.contiguous()
     return out, lse
 
 
@@ -2282,6 +2291,7 @@ def _build_bucketed_k2q_csr(
     *,
     bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    parallel_offsets: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels.
 
@@ -2295,6 +2305,7 @@ def _build_bucketed_k2q_csr(
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=parallel_offsets,
     )
 
 
@@ -2368,6 +2379,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         num_kv_blocks,
         bucket_size_blocks=bucket_size_blocks,
         q2k_block_nums=q2k_block_nums,
+        parallel_offsets=arch // 10 >= 10,
     )
 
     has_block_sizes = block_sizes is not None
@@ -2490,7 +2502,28 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         )
         if source is not None
     )
-    direct_dkv = _num_q_groups == 1 and not dkv_overlaps_input
+    pair_words = (num_q_blocks + 31) // 32
+    pair_count = (num_kv_blocks + 1) // 2
+    pair_bytes = batch_size * num_heads * (
+        num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + _num_q_groups * num_kv_blocks
+    ) * 4
+    use_paired_kv = (
+        arch // 10 == 10
+        and q2k_block_nums is not None
+        and num_kv_blocks >= 2
+        and q2k_block_index.is_contiguous()
+        and q2k_block_nums.is_contiguous()
+        and pair_bytes <= 64 * 1024 * 1024
+    )
+    pair_tensors = ()
+    if use_paired_kv:
+        pair_bits = torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device)
+        pair_duplicates = torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device)
+        pair_flags = torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device)
+        pair_residuals = torch.empty((batch_size, num_heads, _num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device)
+        pair_tensors = (q2k_block_index, q2k_block_nums, pair_bits, pair_duplicates, pair_flags, pair_residuals)
+
+    direct_dkv = _num_q_groups == 1 and not dkv_overlaps_input and not use_paired_kv
     if direct_dkv:
         # K blocks with no Q edges do not launch a writer.
         dk.zero_()
@@ -2515,6 +2548,8 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
     compile_key = (
         "sm100_bucketed_k2q",
+        use_paired_kv,
+        bucket_size_blocks if use_paired_kv else None,
         q.dtype,
         head_dim,
         sparse_block_size,
@@ -2554,11 +2589,16 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         var_bs_t = _to_cute_tensor(variable_block_sizes, leading_dim=1)
         ws_t = _to_cute_tensor(workspace, fully_dynamic=True)
 
-        bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
-            sparse_block_size=sparse_block_size,
-            has_block_sizes=has_block_sizes,
-            atomic_dkv=not direct_dkv,
-        )
+        if use_paired_kv:
+            from cudnn.block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100_paired_v3 import MixedKvBackwardSm100
+
+            bwd_kernel = MixedKvBackwardSm100(sparse_block_size, has_block_sizes, bucket_size_blocks)
+        else:
+            bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
+                sparse_block_size=sparse_block_size,
+                has_block_sizes=has_block_sizes,
+                atomic_dkv=not direct_dkv,
+            )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
             bwd_kernel,
@@ -2578,6 +2618,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             ws_t,
             softmax_scale,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            *(_to_cute_tensor(t, assumed_align=4) for t in pair_tensors),
             options="--enable-tvm-ffi",
         )
 
@@ -2599,6 +2640,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             workspace,
             softmax_scale,
             current_stream,
+            *pair_tensors,
         )
 
     return dq, dk, dv

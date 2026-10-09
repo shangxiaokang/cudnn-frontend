@@ -1272,7 +1272,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 pipeline_o_epi,
                 gmem_tiled_copy_O,
                 tma_atom_O,
-                Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
+                Float32(1.0) if const_expr(self.is_sage_fp8) else (Float32(1.0) if softmax_scale_log2 <= 0.0 else softmax_scale_log2),
                 oStats,
                 oExchange,
                 mVScale,
@@ -1965,7 +1965,7 @@ class BlockSparseAttnForwardSm100Blk64:
             )
 
             softmax = SoftmaxSm100.create(
-                Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
+                Float32(1.0) if const_expr(self.is_sage_fp8) else (Float32(1.0) if softmax_scale_log2 <= 0.0 else softmax_scale_log2),
                 rescale_threshold=(SAGE_P_RESCALE_THRESHOLD if const_expr(self.is_sage_fp8) else 8.0 if const_expr(self.q_dtype.width == 16) else 0.0),
                 softmax_scale=softmax_scale,
             )
@@ -2191,6 +2191,13 @@ class BlockSparseAttnForwardSm100Blk64:
             for j in cutlass.range_constexpr(32):
                 tSrS_t2r[c * 32 + j] = vals[j]
 
+        if score_scale_log2 <= Float32(0.0):
+            # max(scale * S) is not scale * max(S) for negative scales.
+            # Scale finite scores before introducing -inf mask sentinels so
+            # zero scale gives a uniform distribution, including partial K.
+            for i in cutlass.range_constexpr(0, 128, 2):
+                tSrS_t2r[i], tSrS_t2r[i + 1] = cute.arch.mul_packed_f32x2((tSrS_t2r[i], tSrS_t2r[i + 1]), (score_scale_log2, score_scale_log2))
+
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 1], block_size_hi)
@@ -2228,7 +2235,7 @@ class BlockSparseAttnForwardSm100Blk64:
             row_max, acc_scale = softmax.update_row_max(scaled_group_max.load(), is_first)
         else:
             if const_expr(use_ldred_rowmax):
-                full_blocks = (block_size_lo == Int32(self.sparse_block_size)) & (block_size_hi == Int32(self.sparse_block_size))
+                full_blocks = (block_size_lo == Int32(self.sparse_block_size)) & (block_size_hi == Int32(self.sparse_block_size)) & (score_scale_log2 > 0.0)
                 row_max = Float32(0.0)
                 acc_scale = Float32(0.0)
                 if full_blocks:
@@ -2637,7 +2644,9 @@ class BlockSparseAttnForwardSm100Blk64:
         exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
         if const_expr(self.allow_empty_block_nums):
             is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
-            if not is_zero_output:
+            # Aligned TMEM loads require converged participation of the entire warp.
+            warp_needs_tmem = cute.arch.vote_ballot_sync(not is_zero_output) != 0
+            if warp_needs_tmem:
                 bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                     Int32(tmem_o0_addr),
                     Int32(tmem_o1_addr),
