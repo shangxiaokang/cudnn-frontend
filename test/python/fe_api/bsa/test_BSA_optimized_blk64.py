@@ -56,6 +56,26 @@ def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("splits", [1, 2])
+def test_bshd_singleton_stride_alignment(splits):
+    bsa = _bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    torch.manual_seed(20261009)
+    q = torch.empty_strided((1, 64, 1, 128), (1, 128, 1, 1), device="cuda", dtype=torch.bfloat16)
+    q.copy_(torch.randn(q.shape, device="cuda", dtype=q.dtype))
+    k = torch.randn_like(q.contiguous())
+    v = torch.randn_like(k)
+    assert not interface._bshd_tma_compatible(q)
+    indices = torch.zeros((1, 1, 1, 1), device="cuda", dtype=torch.int32)
+    sizes = torch.full((1,), 64, device="cuda", dtype=torch.int32)
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, 1, sizes, sparse_block_size=64, layout="bshd", kv_splits=splits)
+    mask = block_sparse_mask(indices, 1, sizes, 64, 64, 64)
+    ref_output, ref_lse = attention_reference(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mask)
+    torch.testing.assert_close(output.transpose(1, 2).float(), ref_output, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
 @pytest.mark.parametrize("seqlen", [193, 1089])
 def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):

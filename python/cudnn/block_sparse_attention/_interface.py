@@ -122,7 +122,7 @@ def _bshd_tma_compatible(t: torch.Tensor) -> bool:
     return (
         t.stride(-1) == 1
         and t.data_ptr() % 16 == 0
-        and all(size <= 1 or (stride > 0 and stride * t.element_size() % 16 == 0) for size, stride in zip(t.shape[:-1], t.stride()[:-1]))
+        and all(stride > 0 and stride * t.element_size() % 16 == 0 for stride in t.stride()[:-1])
     )
 
 
