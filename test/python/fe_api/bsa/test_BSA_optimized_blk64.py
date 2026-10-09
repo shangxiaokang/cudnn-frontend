@@ -8,7 +8,11 @@ import importlib
 import pytest
 import torch
 
-from fe_api.bsa.bsa_reference import attention_reference, block_sparse_mask
+from fe_api.bsa.bsa_reference import (
+    attention_backward_reference,
+    attention_reference,
+    block_sparse_mask,
+)
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -276,3 +280,46 @@ def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
             expected = torch.full_like(gradient, sq / 128 if i == 2 else 0)
             torch.testing.assert_close(gradient, expected, atol=0, rtol=0)
         assert len(cache) == 1
+
+
+@pytest.mark.L1
+def test_sm100_short_wide_regular_backward(monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("short wide backward policy is tuned for SM100")
+    bsa = _bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(20261009)
+    block_size, blocks, dim = 64, 32, 128
+    seqlen = block_size * blocks
+    q, k, v = [
+        torch.randn((1, seqlen, 1, dim), device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    dout = torch.randn_like(q)
+    ids = torch.arange(blocks, device="cuda", dtype=torch.int32)
+    indices = ids.view(1, 1, 1, blocks).expand(1, 1, blocks, blocks).contiguous()
+    counts = (ids + 1).view(1, 1, blocks).contiguous()
+    sizes = torch.full((blocks,), block_size, device="cuda", dtype=torch.int32)
+    kwargs = dict(
+        q2k_block_nums=counts,
+        block_sizes=sizes,
+        sparse_block_size=block_size,
+        layout="bshd",
+    )
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs)
+    gradients = bsa.block_sparse_attention_backward(dout, q, k, v, output, lse, indices, **kwargs)
+    mask = torch.where(
+        ids[:, None] >= ids[None, :],
+        torch.tensor(0.0, device="cuda"),
+        torch.tensor(float("-inf"), device="cuda"),
+    )
+    mask = mask.repeat_interleave(block_size, 0).repeat_interleave(block_size, 1)[None, None]
+    ref = attention_backward_reference(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dout.transpose(1, 2), mask
+    )
+    torch.testing.assert_close(lse, ref[1], atol=0.03, rtol=0.03)
+    results = (output.transpose(1, 2), *(gradient.transpose(1, 2) for gradient in gradients))
+    for got, expected in zip(results, (ref[0], *ref[2:])):
+        torch.testing.assert_close(got.float(), expected, atol=0.03, rtol=0.03)
+    assert any(key[1] is False for key in interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)

@@ -2507,10 +2507,14 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     pair_bytes = batch_size * num_heads * (
         num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + _num_q_groups * num_kv_blocks
     ) * 4
+    # Paired metadata costs more than it saves for short, wide block masks on
+    # SM100. Keep the paired path for small sparse masks and for 128+ Q blocks.
+    short_wide_sm100 = arch == 100 and 32 <= num_q_blocks < 128 and q2k_block_index.shape[-1] >= 32
     use_paired_kv = (
         arch // 10 == 10
         and q2k_block_nums is not None
         and num_kv_blocks >= 2
+        and not short_wide_sm100
         and q2k_block_index.is_contiguous()
         and q2k_block_nums.is_contiguous()
         and pair_bytes <= 64 * 1024 * 1024
